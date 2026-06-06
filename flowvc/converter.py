@@ -56,7 +56,7 @@ class SinusoidalEmbedding(nn.Module):
 # ── 時間 MLP ────────────────────────────────────────────────────
 
 class TimeMLP(nn.Module):
-    """正弦波埋め込み → MLP → 時間条件付け。"""
+    """Sinusoidal embedding → MLP → time conditioning (standard init)."""
 
     def __init__(self, dim: int = 256):
         super().__init__()
@@ -66,9 +66,7 @@ class TimeMLP(nn.Module):
             nn.SiLU(),
             nn.Linear(dim, dim),
         )
-        # 最終層ゼロ初期化
-        nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.zeros_(self.mlp[-1].bias)
+        # Standard init — NOT zero-init. Time signal must be learned from step 0.
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         return self.mlp(self.sinusoidal(t))
@@ -121,46 +119,25 @@ class FlowBlock(nn.Module):
     ):
         super().__init__()
         self.dwconv = CausalConv1d(dim, dim, kernel_size, dilation=dilation, groups=dim)
-        self.adaln = AdaLNZero(dim, cond_dim)
-
-        # MLP（逆ボトルネック + GRN）
+        self.norm = nn.LayerNorm(dim)
         hidden = dim * mlp_expansion
         self.pwconv1 = nn.Linear(dim, hidden)
         self.act = nn.GELU()
         self.grn = GRN(hidden)
         self.pwconv2 = nn.Linear(hidden, dim)
 
-        # LayerScale
-        self.gamma = nn.Parameter(torch.ones(1, 1, dim) * 1e-4)  # near-zero; 1e-4 safe for fp16
-
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, T, dim) — 隠れ状態
-            cond: (B, T, cond_dim) — 時間 + 話者 + 韻律
-        Returns:
-            (B, T, dim)
-        """
-        # DWConv（チャネルファースト）
-        h = x.transpose(1, 2)  # (B, dim, T)
+        h = x.transpose(1, 2)
         h = self.dwconv(h)
-        h = h.transpose(1, 2)  # (B, T, dim)
-
-        # AdaLN-Zero
-        h, gate = self.adaln(h, cond)
-
-        # MLP
+        h = h.transpose(1, 2)
+        h = self.norm(h)
         h = self.pwconv1(h)
         h = self.act(h)
-        h = h.transpose(1, 2)  # (B, hidden, T) GRN用
+        h = h.transpose(1, 2)
         h = self.grn(h)
-        h = h.transpose(1, 2)  # (B, T, hidden)
+        h = h.transpose(1, 2)
         h = self.pwconv2(h)
-
-        # LayerScale + ゲート
-        h = self.gamma * h * gate.sigmoid()
-
-        return x + h
+        return x + h  # standard residual, no gate suppression
 
 
 # ── ベクトル場ネットワーク ──────────────────────────────────────
@@ -217,7 +194,7 @@ class VectorFieldNet(nn.Module):
 
         # 出力射影
         self.out_proj = nn.Linear(cfg.hidden_dim, cfg.latent_dim)
-        self.out_gate = nn.Parameter(torch.ones(1) * 0.1)  # increased from 0.01 for better Phase 2 encoder gradient flow
+        self.out_gate = nn.Parameter(torch.ones(1))  # 1.0 = no gating, let VFN learn freely
 
     def _assemble_cond(
         self, t: torch.Tensor, speaker_emb: torch.Tensor,

@@ -58,11 +58,11 @@ def train(args):
     # VFN adapted for AudioDec latent
     vfn = make_vector_field_net(
         latent_dim=AUDIODEC_DIM,  # 64
-        hidden_dim=128,            # scaled down from 512
+        hidden_dim=256,            # increased for 160Hz latent
         speaker_dim=192,
         prosody_dim=3,
-        n_blocks=8,
-        dilations=(1, 2, 4, 8, 1, 2, 4, 8),
+        n_blocks=12,
+        dilations=(1, 2, 4, 8, 1, 2, 4, 8, 1, 2, 4, 8),
     ).to(device)
 
     # ECAPA on CPU (too large for MPS alongside AudioDec)
@@ -82,6 +82,22 @@ def train(args):
         params = list(vfn.parameters())
         opt = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.98))
         model_dict = {"vfn": vfn, "prosody": prosody}
+        # Progressive t sampling: start narrow, expand
+        t_min = 0.0
+        t_max = 1.0
+        use_residual = True  # residual → CFM curriculum
+
+    # ── Phase 1b: CFM curriculum (residual warmstart) ──
+    elif args.phase == 11:
+        decoder.eval()
+        prosody.eval()
+        for m in [decoder, prosody]:
+            for p in m.parameters():
+                p.requires_grad = False
+        params = list(vfn.parameters())
+        opt = torch.optim.AdamW(params, lr=args.lr * 0.1, betas=(0.9, 0.98))
+        model_dict = {"vfn": vfn, "prosody": prosody}
+        use_residual = False  # full CFM
 
     # ── Phase 2: E2E (VFN only, decoder frozen, audio-domain loss) ──
     else:
@@ -122,6 +138,53 @@ def train(args):
                     spk_emb = spk_emb.to(device)
                     prompt = prompt.to(device)
                     pros = prosody(src)
+                # Residual baseline
+                z_out = vfn(z_src, torch.zeros(1, device=device), spk_emb, prompt, pros)
+                loss = F.mse_loss(z_out, z_tgt) + 0.1 * F.mse_loss(z_out, z_src)
+
+            elif args.phase == 12:
+                with torch.no_grad():
+                    z_src = encoder.encode(src)
+                    z_tgt = encoder.encode(tgt)
+                    spk_emb, prompt = speaker_enc(ref)
+                    spk_emb = spk_emb.to(device)
+                    prompt = prompt.to(device)
+                    pros = prosody(src)
+                # Patch Flow: group 4 frames → patch dim 256, project to 64
+                B, T, D = z_src.shape
+                pad = (4 - T % 4) % 4
+                if pad > 0:
+                    z_src = F.pad(z_src, (0, 0, 0, pad))
+                    z_tgt = F.pad(z_tgt, (0, 0, 0, pad))
+                z_src_p = z_src.reshape(B, -1, 4, D).flatten(2)  # (B, T/4, 256)
+                z_tgt_p = z_tgt.reshape(B, -1, 4, D).flatten(2)
+                # Fixed random projection 256→64
+                proj = torch.randn(256, 64, device=device) * 0.02
+                z_src_p = z_src_p @ proj
+                z_tgt_p = z_tgt_p @ proj
+                
+                # CFM on patches
+                t_vals = torch.rand(B, device=device)
+                z_t = (1 - t_vals.view(B,1,1)) * z_src_p + t_vals.view(B,1,1) * z_tgt_p + torch.randn_like(z_src_p) * 0.001
+                v_target = z_tgt_p - z_src_p
+                v_pred = vfn(z_t, t_vals, spk_emb, prompt, pros)
+                cfm = F.mse_loss(v_pred, v_target)
+                
+                # Auxiliary: t=0 anchor
+                v0 = vfn(z_src_p, torch.zeros(B, device=device), spk_emb, prompt, pros)
+                aux = F.mse_loss(v0, v_target)
+                
+                loss = cfm + 0.3 * aux
+
+            elif args.phase == 11:
+                with torch.no_grad():
+                    z_src = encoder.encode(src)
+                    z_tgt = encoder.encode(tgt)
+                    spk_emb, prompt = speaker_enc(ref)
+                    spk_emb = spk_emb.to(device)
+                    prompt = prompt.to(device)
+                    pros = prosody(src)
+                # Full CFM after residual warmstart
                 loss, _ = cfm_loss(vfn, z_src, z_tgt, spk_emb, prompt, pros)
 
             else:  # Phase 2
