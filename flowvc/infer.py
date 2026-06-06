@@ -190,7 +190,7 @@ def profile(device="cpu", chunk_ms=80, ode_steps=4):
     for _ in range(30):
         with torch.no_grad():
             z = encoder.encode(wav)
-            p = torch.zeros(z.size(0), z.size(1), 3, device=dev)  # dummy prosody for profile (FCPE needs torchfcpe fix)
+            p = prosody(wav)
             _ = solve_cfm_euler(vfn, z, spk_emb, prompt, p, n_steps=ode_steps)
             _ = decoder(z, spk_emb)
 
@@ -201,7 +201,7 @@ def profile(device="cpu", chunk_ms=80, ode_steps=4):
     N = 50
     for name, fn in [
         ("encoder", lambda: encoder.encode(wav)),
-        ("prosody", lambda: z.new_zeros(z.size(0), z.size(1), 3)),  # FCPE needs torchfcpe fix
+        ("prosody", lambda: prosody(wav)),
         ("cfm_ode", lambda: solve_cfm_euler(vfn, z, spk_emb, prompt, p, n_steps=ode_steps)),
         ("decoder", lambda: decoder(z, spk_emb)),
     ]:
