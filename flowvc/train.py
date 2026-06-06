@@ -12,6 +12,7 @@ from .converter import make_vector_field_net, solve_cfm_euler
 from .ecapa import ECAPASpeakerEncoder  # pretrained ECAPA-TDNN
 from .prosody import make_prosody_extractor
 from .cfm_loss import CFMLoss
+from .disentangle import KanadeDisentangler, AUDIODEC_DIM, SPEAKER_DIM
 from .dataset import VCTKDataset, create_dataloader
 
 
@@ -52,8 +53,12 @@ def train(args):
     for p in encoder.parameters():
         p.requires_grad = False
 
-    # AudioDec decoder
-    decoder = AudioDecDecoder(device=str(device)).to(device)
+    # AudioDec decoder (on CPU to save MPS memory — used only in Phase 2 forward)
+    decoder = AudioDecDecoder(device="cpu")
+
+    # Optional modules (used only in specific phases)
+    disentangler = None
+    vfn_small = None
 
     # VFN adapted for AudioDec latent
     vfn = make_vector_field_net(
@@ -99,7 +104,46 @@ def train(args):
         model_dict = {"vfn": vfn, "prosody": prosody}
         use_residual = False  # full CFM
 
-    # ── Phase 2: E2E (VFN only, decoder frozen, audio-domain loss) ──
+    # ── Phase 20: Disentanglement training ──
+    elif args.phase == 20:
+        disentangler = KanadeDisentangler().to(device)
+        decoder.eval(); prosody.eval()
+        for m in [encoder, decoder, prosody]:
+            for p in m.parameters():
+                p.requires_grad = False
+        params = list(disentangler.parameters())
+        opt = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.98))
+        model_dict = {"disentangler": disentangler}
+
+    # ── Phase 21: Converter with disentangled latent ──
+    elif args.phase == 21:
+        disentangler = KanadeDisentangler().to(device)
+        decoder.eval(); prosody.eval()
+        for m in [encoder, decoder, prosody, speaker_enc]:
+            for p in m.parameters():
+                p.requires_grad = False
+        # VFN for speaker-only prediction (32-dim input, 32-dim output)
+        vfn_small = make_vector_field_net(
+            latent_dim=SPEAKER_DIM, hidden_dim=128, speaker_dim=192,
+            prosody_dim=3, n_blocks=6,
+            dilations=(1,2,4,8,1,2),
+        ).to(device)
+        params = list(disentangler.parameters()) + list(vfn_small.parameters())
+        opt = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.98))
+        model_dict = {"disentangler": disentangler, "vfn_small": vfn_small}
+
+    # ── Phase 12/13: Patch CFM variants ──
+    elif args.phase in (12, 13):
+        decoder.eval()
+        prosody.eval()
+        for m in [decoder, prosody]:
+            for p in m.parameters():
+                p.requires_grad = False
+        params = list(vfn.parameters())
+        opt = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.98))
+        model_dict = {"vfn": vfn, "prosody": prosody}
+
+    # ── Phase 2: E2E ──
     else:
         decoder.eval()
         for m in [decoder, speaker_enc, prosody]:
@@ -141,6 +185,74 @@ def train(args):
                 # Residual baseline
                 z_out = vfn(z_src, torch.zeros(1, device=device), spk_emb, prompt, pros)
                 loss = F.mse_loss(z_out, z_tgt) + 0.1 * F.mse_loss(z_out, z_src)
+
+            elif args.phase == 13:
+                with torch.no_grad():
+                    z_src = encoder.encode(src)
+                    z_tgt = encoder.encode(tgt)
+                    spk_emb, prompt = speaker_enc(ref)
+                    spk_emb = spk_emb.to(device)
+                    prompt = prompt.to(device)
+                    pros = prosody(src)
+                # Patch CFM v2: learnable projection + overlapping + multi-anchor
+                B, T, D = z_src.shape
+                patch_size, stride = 4, 2  # 50% overlap
+                # Unfold into overlapping patches
+                z_src_u = z_src.unfold(1, patch_size, stride)  # (B, n_patches, D, 4)
+                z_tgt_u = z_tgt.unfold(1, patch_size, stride)
+                n_patches = z_src_u.size(1)
+                z_src_p = z_src_u.reshape(B, n_patches, D*patch_size)  # (B, n, 256)
+                z_tgt_p = z_tgt_u.reshape(B, n_patches, D*patch_size)
+                # Learnable projection 256→64
+                if not hasattr(vfn, '_proj'):
+                    vfn._proj = nn.Linear(256, 64).to(device)
+                z_src_p = vfn._proj(z_src_p)
+                z_tgt_p = vfn._proj(z_tgt_p)
+                
+                # CFM with 3-point auxiliary anchors (t=0, 0.5, 1.0)
+                t_vals = torch.rand(B, device=device)
+                z_t = (1 - t_vals.view(B,1,1)) * z_src_p + t_vals.view(B,1,1) * z_tgt_p + torch.randn_like(z_src_p) * 0.001
+                v_target = z_tgt_p - z_src_p
+                v_pred = vfn(z_t, t_vals, spk_emb, prompt, pros)
+                cfm = F.mse_loss(v_pred, v_target)
+                
+                # Multi-point auxiliary anchors
+                aux = 0.0
+                for t_a in [0.0, 0.5, 1.0]:
+                    v_a = vfn((1-t_a)*z_src_p + t_a*z_tgt_p,
+                             torch.full((B,), t_a, device=device), spk_emb, prompt, pros)
+                    aux = aux + F.mse_loss(v_a, v_target)
+                aux = aux / 3.0
+                
+                loss = cfm + 0.5 * aux
+
+            elif args.phase == 20:
+                # Disentanglement: train content bottleneck + speaker encoder
+                z = encoder.encode(src)
+                z_content, z_spk = disentangler(z)
+                # Decode from content + speaker → reconstruction loss only
+                z_out = z_content + z_spk
+                out = decoder(z_out.cpu()).to(device)
+                loss = F.l1_loss(out, src)
+
+            elif args.phase == 21:
+                # Converter with disentangled latent
+                with torch.no_grad():
+                    z_src = encoder.encode(src)
+                    z_tgt = encoder.encode(tgt)
+                    ecapa_emb = speaker_enc(ref)
+                    if isinstance(ecapa_emb, tuple):
+                        ecapa_emb = ecapa_emb[0]
+                    ecapa_emb = ecapa_emb.to(device)
+                    pros = prosody(src)
+                # Split source, keep content, predict target speaker
+                c_src, _ = disentangler(z_src)
+                s_pred = vfn_small(c_src, torch.zeros(1, device=device), ecapa_emb, None, pros)
+                # Reconstruct: source content + predicted speaker
+                s_pred_exp = s_pred.mean(dim=1, keepdim=True).expand(-1, c_src.size(1), -1)
+                z_out = c_src + s_pred_exp
+                out = decoder(z_out.cpu()).to(device)
+                loss = F.l1_loss(out, tgt)
 
             elif args.phase == 12:
                 with torch.no_grad():
@@ -194,8 +306,9 @@ def train(args):
                     spk_emb = spk_emb.to(device)
                     prompt = prompt.to(device)
                     pros = prosody(src)
-                z_tgt = solve_cfm_euler(vfn, z_src, spk_emb, prompt, pros, n_steps=4)
-                out = decoder(z_tgt)
+                # Residual prediction + audio-domain loss
+                z_out = vfn(z_src, torch.zeros(1, device=device), spk_emb, prompt, pros)
+                out = decoder(z_out.cpu()).to(device)
                 loss = F.l1_loss(out, tgt)
 
             opt.zero_grad()
