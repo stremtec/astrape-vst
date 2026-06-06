@@ -1,17 +1,17 @@
-# 3차 심층 감사 — Batch B: 아키텍처 설계 + 학습 역학
+# 3次深層監査 — Batch B: アーキテクチャ設計 + 学習力学
 
-**대상 파일**: `encoder.py` (F³Encoder), `decoder.py` (F³Decoder, MRFBlock, DecoderStage), `train.py` (3-Phase 학습)
+**対象ファイル**: `encoder.py` (F³Encoder), `decoder.py` (F³Decoder, MRFBlock, DecoderStage), `train.py` (3-Phase 학습)
 
-**분석 일자**: 2026-06-06  
-**분석 범위**: encoder.py 86줄, decoder.py 153줄, train.py 174줄 + 종속 파일 (blocks.py, config.py, converter.py, cfm_loss.py, speaker.py, prosody.py)
+**分析日付**: 2026-06-06  
+**分析範囲**: encoder.py 86줄, decoder.py 153줄, train.py 174줄 + 従属ファイル (blocks.py, config.py, converter.py, cfm_loss.py, speaker.py, prosody.py)
 
 ---
 
-## 1. Encoder Downsampling 전략 분석
+## 1. Encoder Downsampling 戦略分析
 
-### 현재 설계
+### 現在の設計
 
-| Stage | Channel | Stride | Kernel (stride×3) | 누적 DS | Nyquist 주파수 |
+| Stage | Channel | Stride | Kernel (stride×3) | 累積DS | ナイキスト周波数 |
 |-------|---------|--------|--------------------|---------|---------------|
 | 1 | 32 | 2 | 6 | ×2 | 11,025 Hz |
 | 2 | 64 | 2 | 6 | ×4 | 5,512 Hz |
@@ -20,20 +20,20 @@
 | 5 | 512 | 7 | 21 | ×252 | 87 Hz |
 | 6 | 768 | 7 | 21 | ×1,764 | 12.5 Hz |
 
-총 다운샘플링: 2×2×3×3×7×7 = **1,764배** → 44,100Hz → **25Hz**
+총 ダウンサンプリング: 2×2×3×3×7×7 = **1,764배** → 44,100Hz → **25Hz**
 
 ### anti-aliasing 충분성: `kernel_size = stride × 3`
 
-**이론적 기준 (Nyquist-Shannon)**:
-- 이상적인 anti-aliasing 필터는 cutoff frequency ≤ f_s / (2 × stride) 를 가져야 함
-- `kernel_size ≥ 2 × stride` 는 최소 조건 (커널이 한 주기 이상의 샘플을 커버)
-- `kernel_size = stride × 3` 는 이 최소 조건을 1.5배 초과 → **최소 기준은 충족**
+**理論的基準 (Nyquist-Shannon)**:
+- 理想的な anti-aliasing フィルタは cutoff frequency ≤ f_s / (2 × stride) 를 가져야 함
+- `kernel_size ≥ 2 × stride` 는 最小条件 (カーネルが 1周期 以上のサンプルを カバー)
+- `kernel_size = stride × 3` 는 이 最小条件을 1.5배 초과 → **最小基準は満足**
 
 **실제 스펙트럼 관점**:
 - stride=2, kernel=6: 오버랩 = 4 samples → Nyquist 11kHz. 6-tap 필터로 11kHz 이상을 감쇠시키는 것은 **매우 거친 근사**. 가청 대역(20Hz~20kHz)에서 충분한 감쇠를 보장하지 않음.
-- stride=7, kernel=21: 오버랩 = 14 samples → Nyquist ~3.15kHz. 21-tap 필터는 44.1kHz에서 약 0.48ms 길이. 이 정도면 중간 정도의 필터링은 가능하지만 스펙트럼 folding을 완전히 방지할 만큼 sharp한 cutoff를 학습하기는 어려움.
+- stride=7, kernel=21: 오버랩 = 14 samples → Nyquist ~3.15kHz. 21-tap フィルタは 44.1kHz에서 약 0.48ms 길이. 이 정도면 중간 정도의 필터링은 가능하지만 스펙트럼 folding을 완전히 방지할 만큼 sharp한 cutoff를 학습하기는 어려움.
 
-**문제점 (HIGH)**:
+**問題점 (HIGH)**:
 ```
 학습된 strided conv는 anti-aliasing LP filter가 아님 —
 손실 함수(L1 reconstruction)에 의해 형성되며 명시적 주파수 제약이 없음.
@@ -61,7 +61,7 @@ stride=7이 포함된 총괄 downsampling factor 1764 = 2² × 3² × 7².
 
 ---
 
-## 2. Decoder Upsampling 전략 분석
+## 2. Decoder Upsampling 戦略分析
 
 ### TransposedConv + MRFBlock 구조
 
@@ -94,11 +94,11 @@ DecoderStage:
 
 **MRFBlock의 완화 효과**:
 - MRFBlock은 depthwise conv 기반 residual block
-- Multi-scale 커널(3, 7, 11)과 dilation(1, 3, 5)으로 다양한 receptive field 커버
+- Multi-scale 커널(3, 7, 11)과 dilation(1, 3, 5)으로 다양한 receptive field カバー
 - **완화 효과는 제한적** — MRF는 원래 HiFi-GAN에서 multi-scale 패턴 캡처용이지 anti-checkerboard 용도가 아님
-- 체커보드 아티팩트는 transposed conv 자체의 구조적 문제이므로 후처리로 완전히 제거하기 어려움
+- 체커보드 아티팩트는 transposed conv 자체의 구조적 問題이므로 후처리로 완전히 제거하기 어려움
 
-### 큰 stride 먼저 적용하는 이유 분석
+### 큰 stride 먼저 적용하는 이유 分析
 
 Decoder stride 순서: **(7, 7, 3, 3, 2, 2)** — Encoder의 역순.
 
@@ -125,9 +125,9 @@ Decoder stride 순서: **(7, 7, 3, 3, 2, 2)** — Encoder의 역순.
 
 ---
 
-## 3. CausalConvTranspose1d 출력 트리밍 분석
+## 3. CausalConvTranspose1d 출력 트리밍 分析
 
-### 현재 구현
+### 현재 実装
 
 ```python
 class CausalConvTranspose1d(nn.Module):
@@ -141,7 +141,7 @@ class CausalConvTranspose1d(nn.Module):
         return out[:, :, :expected_len]        # 앞부분만 취함
 ```
 
-### 기대 출력 길이 분석
+### 기대 출력 길이 分析
 
 ConvTranspose1d(padding=0)의 출력:
 ```
@@ -176,10 +176,10 @@ L_trimmed = L_in × stride
 - 출력 위치 `t` (t ≥ L_in*S): 가장 마지막 입력의 right tail만 → 정보 불완전
 
 **트리밍의 효과**:
-- `out[:, :, :L_in*S]`: 오른쪽 tail (정보 불완전 구간) 제거 → 인과성에 영향 없음
+- `out[:, :, :L_in*S]`: 오른쪽 tail (정보 불완전 구간) 제거 → 인과성에 影響 없음
 - 왼쪽 warm-up 구간 (t < K-1)은 유지 → 이 구간은 입력 0의 정보만 사용하므로 인과적이지만, **정보가 불완전**할 수 있음
 
-### `padding=kernel_size-1` 제안 평가
+### `padding=kernel_size-1` 제안 評価
 
 "padding=kernel_size-1을 주고 트리밍을 없애라"는 제안:
 ```
@@ -199,11 +199,11 @@ L_out = (L_in - 1)*S + K - 2*(K-1) = L_in*S - S - K + 2
 
 **경미한 개선안**:
 - 트리밍 전에 left side도 kernel_size - stride 만큼 제거하여 출력이 완전한 receptive field를 갖도록 함
-- 또는 ConvTranspose1d 대신 **linear interpolation + Conv1d**를 사용하여 checkerboard와 causal alignment를 동시에 해결
+- 또는 ConvTranspose1d 대신 **linear interpolation + Conv1d**를 사용하여 checkerboard와 causal alignment를 동시에 解決
 
 ---
 
-## 4. 3-Phase 학습 역학 분석
+## 4. 3-Phase 学習力学 分析
 
 ### Phase별 개요
 
@@ -213,7 +213,7 @@ L_out = (L_in - 1)*S + K - 2*(K-1) = L_in*S - S - K + 2
 | 1 | VFN (VectorFieldNet) | Encoder, Decoder, SpeakerEnc, Prosody | CFM MSE | Flow 학습 |
 | 2 | Encoder, Decoder, VFN | SpeakerEnc, Prosody | L1(out, tgt) | E2E 미세조정 |
 
-### Phase 0: AE 재구성의 문제점 (CRITICAL)
+### Phase 0: AE 재구성의 問題점 (CRITICAL)
 
 **Phase 0의 loss 구성**:
 ```python
@@ -229,10 +229,10 @@ loss = F.l1_loss(recon, src)             # reconstruct SOURCE waveform!
 - Decoder는 "src의 내용 + ref의 화자" 정보로 **src 파형을 복원**해야 함
 - 이는 decoder가 **화자 정보를 무시하고 latent에 의존**하도록 학습시킴
 
-**결과적 영향**:
+**결과적 影響**:
 1. **Disentanglement 실패**: Latent z가 화자 정보를 포함해야만 decoder가 src를 복원 가능 → z는 content + speaker 혼합 표현
 2. **Decoder의 FiLM 조건화 무력화**: Decoder는 학습 과정에서 "FiLM이 주는 화자 정보 ≠ 출력 화자"를 경험 → FiLM을 신뢰하지 않게 됨
-3. **Phase 1 악영향**: VFN이 학습하는 latent 공간이 content-only가 아니므로, flow 변환이 content 보존 + speaker 변환을 동시에 수행해야 함 (난이도 상승)
+3. **Phase 1 악影響**: VFN이 학습하는 latent 공간이 content-only가 아니므로, flow 변환이 content 보존 + speaker 변환을 동시에 수행해야 함 (난이도 상승)
 
 **Phase 0 개선 방안**:
 ```python
@@ -259,12 +259,12 @@ loss_recon = F.l1_loss(recon_self, src)
 - `v_target = z_tgt - z_src` (constant velocity field)
 - VFN이 `v_θ(z_t, t, c)` → `z_tgt - z_src`를 예측하도록 학습
 
-**Latent 공간 품질 요구사항**:
+**Latent 공간 품질 요구事項**:
 - 이상적: `z_src`와 `z_tgt`가 content는 동일하고 speaker만 다른 표현
 - 현실 (Phase 0 설계 결함으로): `z_src`와 `z_tgt`에 content와 speaker 정보가 혼재
 - CFM은 직선 보간(OT path)을 가정하는데, 혼합 표현의 직선 보간이 semantically valid한지 의문
 
-**직선 보간의 문제**:
+**직선 보간의 問題**:
 - Content+speaker 혼합 공간에서 `(1-t)*z_src + t*z_tgt`는 t=0.5일 때 두 화자의 중간 목소리 + 중간 내용이 됨
 - 이 "중간 상태"가 실제 voice conversion의 물리적 과정을 대표하는가? → **의문**
 - Disentangled 표현이었다면: content는 불변, speaker만 interpolate → 훨씬 자연스러운 flow path
@@ -280,14 +280,14 @@ loss = F.l1_loss(out, tgt)
 
 **Gradient 흐름**: loss → decoder → solver(4 VFN calls) → encoder
 
-**문제점**:
+**問題점**:
 1. **ODE solver 통한 역전파**: 4-step Euler + half-step refinement → 총 5회의 VFN forward → 메모리 사용량 5배, gradient instability 위험
 2. **Encoder의 이중 역할**: Phase 2에서 encoder는 "content 추출"과 "flow-friendly latent 생성"을 동시에 학습 → 목표 충돌 가능성
 3. **Noise regularization 부재**: `encoder.encode()`는 noise 없음 → Phase 0에서 학습한 noise robustness가 Phase 2에서 활용되지 않음
 
 ---
 
-## 5. Optimizer 분석: betas=(0.8, 0.9), weight_decay=0.01
+## 5. Optimizer 分析: betas=(0.8, 0.9), weight_decay=0.01
 
 ### betas 비교
 
@@ -313,7 +313,7 @@ loss = F.l1_loss(out, tgt)
 
 **권고**: β₂ = 0.95 또는 0.98로 상향 조정 검토. Phase 전환 시에만 optimizer state reset을 고려.
 
-### weight_decay = 0.01 분석
+### weight_decay = 0.01 分析
 
 - AdamW에서 weight_decay는 L2 정규화와 유사하지만 gradient와 decoupled
 - 94M 파라미터, batch_size=1, steps=200K 상황에서:
@@ -327,7 +327,7 @@ loss = F.l1_loss(out, tgt)
 
 ---
 
-## 6. Phase 1 Freeze 전략 분석
+## 6. Phase 1 Freeze 戦略分析
 
 ### LayerNorm Running Stats 동결
 
@@ -343,7 +343,7 @@ p.requires_grad = False  # → gamma, beta 파라미터 동결
 
 **Phase 0 수렴 가정의 타당성**:
 
-| 가정 | 평가 |
+| 가정 | 評価 |
 |------|------|
 | Encoder가 충분히 수렴했음 | Phase 0이 200K steps이면 **대체로 타당** |
 | Running stats가 안정적임 | **조건부 타당** — batch_size=1로 인한 분산이 stats에 누적되었을 수 있음 |
@@ -353,7 +353,7 @@ p.requires_grad = False  # → gamma, beta 파라미터 동결
 - Encoder의 `ConvNeXtV2Block` 내부에 LayerNorm이 있음 (DWConv 후 channel-wise LN)
 - 이 LayerNorm의 running stats가 Phase 0의 입력 분포(src 음성)에 맞춰져 있음
 - Phase 1에서는 src와 tgt 모두 encode → tgt의 분포가 미묘하게 다를 수 있음
-- 그러나 encoder를 통한 latent 추출은 결정론적(deterministic)이므로, running stats의 경미한 mismatch는 큰 문제가 되지 않음
+- 그러나 encoder를 통한 latent 추출은 결정론적(deterministic)이므로, running stats의 경미한 mismatch는 큰 問題가 되지 않음
 
 **Phase 2에서의 LayerNorm 상태**:
 ```python
@@ -371,14 +371,14 @@ z_src = encoder.encode(src)  # encode() → forward(training=False)
 - LayerNorm은 `self.training` (모듈 상태) 기준으로 batch stats vs running stats 결정
 - `encoder.encode()` 내부에 `self.eval()` 또는 context manager가 없으므로
 - **encoder.training이 True면 LayerNorm은 batch stats 사용 + running stats 업데이트**
-- training=False 인자는 noise regularization에만 영향 (forward() 함수의 인자)
+- training=False 인자는 noise regularization에만 影響 (forward() 함수의 인자)
 - → **실제로는 training=True 상태로 running stats가 업데이트됨**
 
 이것은 의도된 동작일 수도 있지만, `self.training` 플래그와 `training` 함수 인자의 의미가 분리되어 있어 혼란을 야기할 수 있다.
 
 ---
 
-## 종합 평가
+## 総合 評価
 
 ### 설계 강점
 1. **완전 인과적 구조**: CausalConv1d, CausalConvTranspose1d로 실시간 추론 가능
@@ -386,9 +386,9 @@ z_src = encoder.encode(src)  # encode() → forward(training=False)
 3. **FiLM + zero-init**: 학습 초기에 speaker conditioning이 identity로 시작 → 안정적 수렴
 4. **CFM with OT path**: 직선 경로로 단순하고 효율적인 flow matching
 
-### 설계 약점 (심각도 순)
+### 설계 약점 (深刻度 순)
 
-| # | 문제 | 심각도 | 영향 |
+| # | 問題 | 深刻度 | 影響 |
 |---|------|--------|------|
 | 1 | Phase 0의 src≠ref 재구성 | **CRITICAL** | Latent disentanglement 원천적 실패 |
 | 2 | ConvTranspose1d checkerboard (모든 stage) | **HIGH** | 출력 음질 저하, 주기적 아티팩트 |
@@ -400,7 +400,7 @@ z_src = encoder.encode(src)  # encode() → forward(training=False)
 
 ### 우선 조치 권고
 
-1. **Phase 0 수정** (즉시): `ref → src`로 speaker embedding 변경 → 자기 재구성 학습
+1. **Phase 0 修正** (즉시): `ref → src`로 speaker embedding 변경 → 자기 재구성 학습
 2. **ConvTranspose1d 개선**: kernel_size를 stride의 정수배로 변경 또는 interpolation + Conv1d로 대체
 3. **Anti-aliasing 추가**: stride≥3 stage에 low-pass filter 또는 BlurPool 도입
 4. **β₂ 조정**: 0.95로 변경하고 Phase 전환 시 optimizer state 재초기화 검토
