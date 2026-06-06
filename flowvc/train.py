@@ -21,6 +21,8 @@ def save_checkpoint(models: dict, opt, step: int, path: str):
         sd = model.state_dict()
         if name == "prosody":
             sd = {k: v for k, v in sd.items() if not k.startswith("_fcpe_model.")}
+        if name == "speaker_enc":
+            sd = {k: v for k, v in sd.items() if not k.startswith("_model.")}
         ckpt[name] = sd
     torch.save(ckpt, path)
 
