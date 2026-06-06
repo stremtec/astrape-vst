@@ -1,16 +1,16 @@
 """
-FlowVC configuration.
+FlowVC 設定。
 """
 
 from __future__ import annotations
 from dataclasses import dataclass, field
 
 
-# ── Encoder ────────────────────────────────────────────────────
+# ── エンコーダ ──────────────────────────────────────────────────
 
 @dataclass
 class EncoderConfig:
-    """F³-Encoder: causal ConvNeXt v2, KL-free continuous AE."""
+    """F³-Encoder: 因果的ConvNeXt v2, KLフリー連続AE。"""
     sample_rate: int = 44100
     latent_rate: int = 25              # Hz, hop = 44100/25 = 1764
     stages: tuple[int, ...] = field(
@@ -22,15 +22,15 @@ class EncoderConfig:
     kernel_size: int = 7
     blocks_per_stage: int = 2
     mlp_expansion: int = 4
-    noise_sigma: float = 0.01          # F³-Tokenizer noise regularization
+    noise_sigma: float = 0.01          # F³-Tokenizer ノイズ正則化
     use_grn: bool = True
 
 
-# ── Decoder ────────────────────────────────────────────────────
+# ── デコーダ ────────────────────────────────────────────────────
 
 @dataclass
 class DecoderConfig:
-    """F³-Decoder: causal ConvNeXt v2 + MRF upsampler."""
+    """F³-Decoder: 因果的ConvNeXt v2 + MRFアップサンプラ。"""
     sample_rate: int = 44100
     latent_dim: int = 768
     stages: tuple[int, ...] = field(
@@ -50,11 +50,11 @@ class DecoderConfig:
     use_grn: bool = True
 
 
-# ── Speaker Encoder ────────────────────────────────────────────
+# ── 話者エンコーダ ──────────────────────────────────────────────
 
 @dataclass
 class SpeakerEncoderConfig:
-    """Speaker encoder: causal ConvNeXt v2 + attention pooling."""
+    """話者エンコーダ: 因果的ConvNeXt v2 + アテンションプーリング。"""
     sample_rate: int = 44100
     speaker_dim: int = 192
     stages: tuple[int, ...] = field(
@@ -66,18 +66,18 @@ class SpeakerEncoderConfig:
     kernel_size: int = 7
     blocks_per_stage: int = 2
     attn_pool_heads: int = 8
-    prompt_tokens: int = 4         # P-Flow speaker prompt
+    prompt_tokens: int = 4         # P-Flow 話者プロンプト
 
 
-# ── Flow Matching Converter ────────────────────────────────────
+# ── Flow Matching 変換器 ────────────────────────────────────────
 
 @dataclass
 class FlowConverterConfig:
-    """Vector Field Network for Conditional Flow Matching."""
+    """条件付きフローマッチング用ベクトル場ネットワーク。"""
     latent_dim: int = 768
     hidden_dim: int = 512
     time_dim: int = 256
-    cond_dim: int = 256              # speaker(192) + prosody(3) → projection
+    cond_dim: int = 256              # 話者(192) + 韻律(3) → 射影
     speaker_dim: int = 192
     prosody_dim: int = 3
     n_blocks: int = 12
@@ -92,13 +92,13 @@ class FlowConverterConfig:
         default_factory=lambda: (3, 6, 9)
     )
     cross_attn_heads: int = 4
-    prompt_dim: int = 192           # matches speaker prompt dim
+    prompt_dim: int = 192           # 話者プロンプト次元に一致
     # CFM
-    sigma_min: float = 0.001        # min noise for stability
-    ode_steps: int = 4              # inference: Euler steps
+    sigma_min: float = 0.001        # 安定性のための最小ノイズ
+    ode_steps: int = 4              # 推論: Eulerステップ数
 
 
-# ── Training ───────────────────────────────────────────────────
+# ── 学習 ────────────────────────────────────────────────────────
 
 @dataclass
 class TrainConfig:
@@ -106,15 +106,15 @@ class TrainConfig:
     cache_dir: str = ""
     sample_rate: int = 44100
     crop_seconds: float = 2.0
-    # Phases
-    phase: int = 0       # 0=AE pretrain, 1=CFM, 2=E2E+GAN
+    # フェーズ
+    phase: int = 0       # 0=AE事前学習, 1=CFM, 2=E2E+GAN
     steps: int = 200000
     batch_size: int = 1
     lr: float = 2e-4
     device: str = "cpu"
-    # Logging
+    # ログ
     log_interval: int = 50
     save_interval: int = 1000
-    # Checkpoints
+    # チェックポイント
     resume: str = ""
     output_dir: str = "./runs"

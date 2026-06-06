@@ -1,38 +1,38 @@
 # Astrape VC ⚡
 
-> **Αστραπή** (astrape) — Greek for "lightning"
+> **Αστραπή** (アストラペー) — ギリシャ語で「稲妻」
 
-Real-time neural voice conversion with Conditional Flow Matching.  
-Fully causal pipeline. 44.1kHz. No MioCodec dependency.
+Conditional Flow Matching によるリアルタイムニューラル音声変換。  
+完全因果的パイプライン。44.1kHz。MioCodec非依存。
 
 ```
-Source(44.1k) → F³-Encoder(causal, KL-free) → z_src
-  → FlowVC Converter(CFM ODE, 4-8 steps)
-  → F³-Decoder(causal, MRF upsampler) → Target(44.1k)
+ソース(44.1k) → F³-Encoder(因果的, KLフリー) → z_src
+  → FlowVC Converter(CFM ODE, 4-8ステップ)
+  → F³-Decoder(因果的, MRFアップサンプラ) → ターゲット(44.1k)
 ```
 
-## Architecture
+## アーキテクチャ
 
-| Component | Params | Description |
+| コンポーネント | パラメータ | 説明 |
 |-----------|:------:|-------------|
-| F³-Encoder | 26.5M | 6-stage causal ConvNeXt v2, KL-free, noise-reg |
-| VectorFieldNet | 37.2M | 12-block CFM converter, AdaLN-Zero, cross-attn |
-| F³-Decoder | 27.9M | 6-stage MRF upsampler, FiLM conditioning |
-| **Total** | **91.6M** | Fully causal, streaming-ready |
+| F³-Encoder | 26.5M | 6段因果的ConvNeXt v2, KLフリー, ノイズ正則化 |
+| VectorFieldNet | 37.2M | 12ブロックCFM変換器, AdaLN-Zero, クロスアテンション |
+| F³-Decoder | 27.9M | 6段MRFアップサンプラ, FiLM条件付け |
+| **合計** | **91.6M** | 完全因果的, ストリーミング対応 |
 
-## Key Features
+## 主要特徴
 
-- **Causal-first**: All convolutions use left-only padding — no future leak
-- **Flow Matching**: Conditional Flow Matching with OT path, 4-step Euler solver
-- **KL-free**: No VQ, no codebook collapse, continuous latent space
-- **ConvNeXt v2**: GRN, LayerScale, inverted bottleneck throughout
-- **44.1kHz native**: No bandwidth extension needed
-- **Zero-init everywhere**: Identity at initialization for stable training
+- **因果的ファースト**: 全畳み込みが左パディングのみ — 未来の情報漏洩なし
+- **Flow Matching**: OTパスによる条件付きフローマッチング, 4ステップEulerソルバ
+- **KLフリー**: VQなし, コードブック崩壊なし, 連続潜在空間
+- **ConvNeXt v2**: GRN, LayerScale, 逆ボトルネックを全体に採用
+- **44.1kHzネイティブ**: 帯域拡張不要
+- **Zero-init全般**: 初期化時に恒等写像, 安定した学習
 
-## Quick Start
+## クイックスタート
 
 ```bash
-# Shape test
+# 形状テスト
 python3 -c "
 from flowvc.encoder import make_encoder
 from flowvc.converter import make_vector_field_net, solve_cfm_euler
@@ -45,7 +45,7 @@ vfn = make_vector_field_net()
 decoder = F3Decoder(DecoderConfig())
 
 B, T_lat = 2, 50
-wav = torch.randn(B, 1, T_lat * 1764)  # 2s @ 44.1kHz
+wav = torch.randn(B, 1, T_lat * 1764)  # 2秒 @ 44.1kHz
 spk = torch.randn(B, 192)
 prompt = torch.randn(B, 4, 192)
 prosody = torch.randn(B, T_lat, 3)
@@ -55,29 +55,29 @@ z_tgt = solve_cfm_euler(vfn, z, spk, prompt, prosody)
 out = decoder(z_tgt, spk)
 
 assert out.shape == wav.shape
-print('✅ Pipeline OK')
+print('✅ パイプラインOK')
 "
 ```
 
-## Design
+## 設計
 
-Based on literature review of 22 arXiv 2026 audio papers.  
-Full design docs in `designs/`.  
-Winning architecture selected via 5-agent parallel review + scoring.
+2026年arXiv音声論文22本の文献レビューに基づく。  
+詳細設計ドキュメントは `designs/` に格納。  
+5エージェント並列レビュー + スコアリングにより最優秀アーキテクチャを選定。
 
-## Status
+## 状況
 
-- [x] F³-Encoder (causal ConvNeXt v2)
-- [x] F³-Decoder (MRF upsampler + FiLM)
-- [x] VectorFieldNet (CFM, 12 blocks)
-- [x] CFM Loss (OT path + sigma regularization)
-- [x] Euler/RK4 ODE Solver
-- [x] Shape tests passed (91.6M params)
-- [ ] Speaker Encoder + Prompt Tokens
-- [ ] Prosody Extractor
-- [ ] Training Pipeline
-- [ ] Streaming Inference
+- [x] F³-Encoder (因果的ConvNeXt v2)
+- [x] F³-Decoder (MRFアップサンプラ + FiLM)
+- [x] VectorFieldNet (CFM, 12ブロック)
+- [x] CFM Loss (OTパス + シグマ正則化)
+- [x] Euler/RK4 ODEソルバ
+- [x] 形状テスト合格 (91.6Mパラメータ)
+- [ ] 話者エンコーダ + プロンプトトークン
+- [ ] 韻律抽出器
+- [ ] 学習パイプライン
+- [ ] ストリーミング推論
 
-## License
+## ライセンス
 
 MIT

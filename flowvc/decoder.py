@@ -1,11 +1,11 @@
 """
-F³-Decoder for FlowVC.
+FlowVC用 F³-Decoder。
 
-Causal ConvNeXt v2 decoder with MRF (Multi-Receptive Field) upsampler.
-Mirrors F³-Encoder: reverses strides with TransposedConv.
-FiLM conditioning from speaker embedding at each stage.
+MRF (Multi-Receptive Field) アップサンプラ付き因果的ConvNeXt v2デコーダ。
+F³-Encoderの逆演算: TransposedConvでストライドを反転。
+各段で話者埋め込みからFiLM条件付け。
 
-Output: 44.1kHz waveform.
+出力: 44.1kHz 波形。
 """
 
 from __future__ import annotations
@@ -14,16 +14,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .blocks import (
-    CausalConv1d, CausalConvTranspose1d, ConvNeXtV2Block, FiLM
-)
+from .blocks import CausalConv1d, CausalConvTranspose1d, ConvNeXtV2Block, FiLM
 from .config import DecoderConfig
 
 
 class MRFBlock(nn.Module):
     """
-    Multi-Receptive Field block (HiFi-GAN style).
-    Parallel Conv1d paths with different kernel sizes and dilations.
+    Multi-Receptive Field ブロック（HiFi-GAN 方式）。
+    異なるカーネルサイズとダイレーションの並列Conv1dパス。
     """
 
     def __init__(
@@ -55,22 +53,18 @@ class MRFBlock(nn.Module):
             residuals.append(h)
 
         h = sum(residuals) / len(residuals)
-        return x + h  # residual
+        return x + h  # 残差
 
 
 class DecoderStage(nn.Module):
-    """One upsampling stage: TransposedConv → MRF ×2 → FiLM."""
+    """1段のアップサンプリング: TransposedConv → MRF ×2 → FiLM。"""
 
     def __init__(
-        self,
-        in_ch: int,
-        out_ch: int,
-        stride: int,
-        kernel_size: int = 7,
-        mrf_config: dict | None = None,
+        self, in_ch: int, out_ch: int, stride: int,
+        kernel_size: int = 7, mrf_config: dict | None = None,
     ):
         super().__init__()
-        stride_kernel = stride * 2 + 1  # ensure good coverage
+        stride_kernel = stride * 2 + 1  # 十分なカバレッジを確保
         self.upsample = CausalConvTranspose1d(
             in_ch, out_ch, kernel_size=stride_kernel, stride=stride
         )
@@ -86,12 +80,12 @@ class DecoderStage(nn.Module):
 
 class F3Decoder(nn.Module):
     """
-    Causal Decoder: latent → waveform.
+    因果的デコーダ: 潜在 → 波形。
     
-    Architecture:
-      z (T_lat, 768) → FiLM → ConvNeXt blocks
-      → 6-stage upsampling (strides: 7,7,3,3,2,2 = ×1764)
-      → Conv1d → tanh → waveform
+    アーキテクチャ:
+      z (T_lat, 768) → FiLM → ConvNeXtブロック
+      → 6段アップサンプリング (ストライド: 7,7,3,3,2,2 = ×1764)
+      → Conv1d → tanh → 波形
     """
 
     def __init__(self, cfg: DecoderConfig):
@@ -99,23 +93,21 @@ class F3Decoder(nn.Module):
         self.cfg = cfg
 
         latent_dim = cfg.latent_dim
-        speaker_dim = 192  # matches speaker encoder output
+        speaker_dim = 192  # 話者エンコーダ出力に一致
 
-        # Input FiLM
+        # 入力FiLM
         self.film_in = FiLM(latent_dim, speaker_dim)
 
-        # Pre-upsampling ConvNeXt blocks
+        # アップサンプリング前 ConvNeXt ブロック
         self.pre_blocks = nn.ModuleList([
             ConvNeXtV2Block(
-                latent_dim,
-                kernel_size=cfg.kernel_size,
-                mlp_expansion=4,
-                use_grn=cfg.use_grn,
+                latent_dim, kernel_size=cfg.kernel_size,
+                mlp_expansion=4, use_grn=cfg.use_grn,
             )
             for _ in range(cfg.pre_upsample_blocks)
         ])
 
-        # Upsampling stages (reverse of encoder)
+        # アップサンプリング段（エンコーダの逆順）
         in_ch = latent_dim
         mrf_cfg = {
             "kernel_sizes": cfg.mrf_kernel_sizes,
@@ -124,39 +116,39 @@ class F3Decoder(nn.Module):
         stages = []
         for out_ch, stride in zip(cfg.stages, cfg.strides):
             stages.append(DecoderStage(in_ch, out_ch, stride, mrf_config=mrf_cfg))
-            # FiLM per stage
+            # 段ごとにFiLM
             stages.append(FiLM(out_ch, speaker_dim))
             in_ch = out_ch
 
         self.upsample_stages = nn.ModuleList(stages)
 
-        # Final projection
+        # 最終射影
         self.final_conv = CausalConv1d(cfg.stages[-1], 1, kernel_size=7)
 
     def forward(self, z: torch.Tensor, speaker_emb: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            z: (B, T_lat, latent_dim) latent @ 25Hz
-            speaker_emb: (B, speaker_dim) target speaker
+            z: (B, T_lat, latent_dim) 潜在 @ 25Hz
+            speaker_emb: (B, speaker_dim) ターゲット話者
         Returns:
-            wav: (B, 1, T_audio) waveform @ 44.1kHz
+            wav: (B, 1, T_audio) 波形 @ 44.1kHz
         """
-        # Input FiLM
+        # 入力FiLM
         x = z.transpose(1, 2)  # (B, dim, T)
         x = self.film_in(x, speaker_emb)
 
-        # Pre-upsampling refinement
+        # アップサンプリング前精緻化
         for block in self.pre_blocks:
             x = block(x)
 
-        # Upsampling stages
-        for i, stage in enumerate(self.upsample_stages):
+        # アップサンプリング段
+        for stage in self.upsample_stages:
             if isinstance(stage, FiLM):
                 x = stage(x, speaker_emb)
             else:
                 x = stage(x)
 
-        # Final
+        # 最終
         x = self.final_conv(x)
         x = torch.tanh(x)
 

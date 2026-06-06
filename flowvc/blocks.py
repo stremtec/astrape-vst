@@ -1,22 +1,21 @@
 """
-Causal ConvNeXt v2 building blocks for FlowVC.
+FlowVC用 因果的ConvNeXt v2 構成ブロック。
 
-All convolutions use left-only padding — no future information leak.
-GRN (Global Response Normalization) from ConvNeXt v2.
+全畳み込みが左パディングのみ — 未来情報の漏洩なし。
+GRN (Global Response Normalization) は ConvNeXt v2 より。
 """
 
 from __future__ import annotations
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ── Causal Conv1d ──────────────────────────────────────────────
+# ── 因果的 Conv1d ──────────────────────────────────────────────
 
 class CausalConv1d(nn.Module):
-    """1D convolution with left-only padding (causal)."""
+    """左パディングのみの1次元畳み込み（因果的）。"""
 
     def __init__(
         self,
@@ -43,7 +42,7 @@ class CausalConv1d(nn.Module):
 
 
 class CausalConvTranspose1d(nn.Module):
-    """Transposed conv with causal output trimming."""
+    """因果的出力トリミング付き転置畳み込み。"""
 
     def __init__(
         self,
@@ -62,7 +61,6 @@ class CausalConvTranspose1d(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, T_in)
         out = self.conv(x)
-        # Trim to causal: output_length = T_in * stride
         expected_len = x.shape[2] * self.stride
         return out[:, :, :expected_len]
 
@@ -71,8 +69,8 @@ class CausalConvTranspose1d(nn.Module):
 
 class GRN(nn.Module):
     """
-    Global Response Normalization from ConvNeXt v2.
-    Channel-wise L2 norm → divisive normalization → learnable scale/bias.
+    ConvNeXt v2 の Global Response Normalization。
+    チャネル方向 L2ノルム → 除算正規化 → 学習可能スケール/バイアス。
     """
 
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -83,19 +81,19 @@ class GRN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, T)
-        Gx = torch.norm(x, p=2, dim=(1, 2), keepdim=True)  # spatial norm
+        Gx = torch.norm(x, p=2, dim=(1, 2), keepdim=True)
         Nx = Gx / (Gx.mean(dim=-1, keepdim=True) + self.eps)
         return self.gamma * (x * Nx) + self.beta + x
 
 
-# ── ConvNeXt v2 Block ──────────────────────────────────────────
+# ── ConvNeXt v2 ブロック ────────────────────────────────────────
 
 class ConvNeXtV2Block(nn.Module):
     """
-    ConvNeXt v2: DWConv7 → LayerNorm → 1×1 expand → GELU → GRN → 1×1 contract.
+    ConvNeXt v2: DWConv7 → LayerNorm → 1×1拡張 → GELU → GRN → 1×1収縮。
 
-    Causal: DWConv uses left-only padding.
-    DropPath for stochastic depth.
+    因果的: DWConvは左パディングのみ。
+    確率的深さのためのDropPath。
     """
 
     def __init__(
@@ -111,14 +109,14 @@ class ConvNeXtV2Block(nn.Module):
         self.use_grn = use_grn
 
         self.dwconv = CausalConv1d(dim, dim, kernel_size, dilation=dilation, groups=dim)
-        self.norm = nn.LayerNorm(dim)  # over channel dim
+        self.norm = nn.LayerNorm(dim)
         self.pwconv1 = nn.Linear(dim, dim * mlp_expansion)
         self.act = nn.GELU()
         if use_grn:
             self.grn = GRN(dim * mlp_expansion)
         self.pwconv2 = nn.Linear(dim * mlp_expansion, dim)
 
-        # LayerScale (zero-init for identity at start)
+        # LayerScale（ゼロ初期化で初期恒等写像）
         self.gamma = nn.Parameter(torch.zeros(1, 1, dim))
 
         # DropPath
@@ -127,22 +125,20 @@ class ConvNeXtV2Block(nn.Module):
             self.drop_path_prob = drop_path
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, T) — channel-first for conv
-        B, C, T = x.shape
-
+        # x: (B, C, T) — チャネルファースト
         shortcut = x
 
         # DWConv
         x = self.dwconv(x)  # (B, C, T)
 
-        # LayerNorm over channel dim
+        # チャネル方向LayerNorm
         x = x.transpose(1, 2)  # (B, T, C)
         x = self.norm(x)
 
         # MLP
         x = self.pwconv1(x)
         x = self.act(x)
-        x = x.transpose(1, 2)  # (B, mlp*C, T) for GRN
+        x = x.transpose(1, 2)  # (B, mlp*C, T) GRN用
         if self.use_grn:
             x = self.grn(x)
         x = x.transpose(1, 2)  # (B, T, mlp*C)
@@ -153,23 +149,22 @@ class ConvNeXtV2Block(nn.Module):
 
         x = x.transpose(1, 2)  # (B, C, T)
 
-        # DropPath (stochastic depth)
+        # DropPath（確率的深さ）
         if self.drop_path and self.training:
             if torch.rand(1).item() < self.drop_path_prob:
                 return shortcut
-            # else scale residual
             x = x / (1.0 - self.drop_path_prob)
 
         return shortcut + x
 
 
-# ── AdaLN-Zero (for Flow Converter) ────────────────────────────
+# ── AdaLN-Zero（Flow変換器用）───────────────────────────────────
 
 class AdaLNZero(nn.Module):
     """
-    Adaptive LayerNorm with zero-initialized gating.
-    cond → MLP → (scale, shift, gate).
-    All zero-init → block is identity at start.
+    ゼロ初期化ゲーティング付き適応的LayerNorm。
+    条件 → MLP → (スケール, シフト, ゲート)。
+    全ゼロ初期化 → ブロックが初期恒等写像。
     """
 
     def __init__(self, dim: int, cond_dim: int, mlp_hidden: int = 256):
@@ -180,7 +175,7 @@ class AdaLNZero(nn.Module):
             nn.SiLU(),
             nn.Linear(mlp_hidden, dim * 3),
         )
-        # Zero-init last layer
+        # 最終層ゼロ初期化
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
@@ -188,7 +183,7 @@ class AdaLNZero(nn.Module):
         """
         Args:
             x: (B, T, dim)
-            cond: (B, T, cond_dim) or (B, cond_dim) — if 2D, broadcast
+            cond: (B, T, cond_dim) または (B, cond_dim) — 2Dならブロードキャスト
         Returns:
             (x_modulated, gate)
         """
@@ -204,10 +199,10 @@ class AdaLNZero(nn.Module):
         return x_mod, gate
 
 
-# ── FiLM (for decoder conditioning) ────────────────────────────
+# ── FiLM（デコーダ条件付け用）───────────────────────────────────
 
 class FiLM(nn.Module):
-    """Feature-wise Linear Modulation with zero-init."""
+    """ゼロ初期化付き特徴量線形変調。"""
 
     def __init__(self, dim: int, cond_dim: int):
         super().__init__()
@@ -218,10 +213,10 @@ class FiLM(nn.Module):
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (B, C, T) — channel-first
+            x: (B, C, T) — チャネルファースト
             cond: (B, cond_dim)
         Returns:
-            (B, C, T) modulated
+            (B, C, T) 変調済み
         """
         gamma, beta = self.proj(cond).chunk(2, dim=-1)  # (B, C)
         gamma = gamma.unsqueeze(-1)  # (B, C, 1)

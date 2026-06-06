@@ -1,30 +1,31 @@
 """
-FlowVC Converter — Conditional Flow Matching ODE.
+FlowVC 変換器 — 条件付きフローマッチング ODE。
 
-Vector Field Network v_θ(z_t, t, c) predicts velocity for source→target flow.
+ベクトル場ネットワーク v_θ(z_t, t, c) がソース→ターゲットの速度場を予測。
 
-Architecture:
-  12 ConvNeXt v2 blocks (dim=512) + AdaLN-Zero(time, condition)
-  + cross-attention to speaker prompt tokens at layers [3,6,9]
-  + zero-init output gate → identity at t=0
+アーキテクチャ:
+  12 個の ConvNeXt v2 ブロック (dim=512) + AdaLN-Zero(時間, 条件)
+  + 話者プロンプトトークンへのクロスアテンション (層 [3,6,9])
+  + ゼロ初期化出力ゲート → t=0 で恒等写像
 
-Inference: Euler or RK4 ODE solver (4-8 steps).
+推論: Euler または RK4 ODE ソルバ (4-8ステップ)。
 """
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .blocks import AdaLNZero, ConvNeXtV2Block, GRN
+from .blocks import AdaLNZero, CausalConv1d, GRN
 from .config import FlowConverterConfig
 
 
-# ── Sinusoidal Time Embedding ──────────────────────────────────
+# ── 正弦波時間埋め込み ──────────────────────────────────────────
 
 class SinusoidalEmbedding(nn.Module):
-    """Transformer-style sinusoidal position embedding for continuous time."""
+    """連続時間用 Transformer 式正弦波位置埋め込み。"""
 
     def __init__(self, dim: int):
         super().__init__()
@@ -33,9 +34,9 @@ class SinusoidalEmbedding(nn.Module):
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            t: (B,) or (B, 1) — continuous time in [0, 1]
+            t: (B,) または (B, 1) — 連続時間 ∈ [0, 1]
         Returns:
-            (B, dim) embedding
+            (B, dim) 埋め込み
         """
         t = t.view(-1, 1).float()
         device = t.device
@@ -52,13 +53,10 @@ class SinusoidalEmbedding(nn.Module):
         return emb
 
 
-import math
-
-
-# ── Time MLP ───────────────────────────────────────────────────
+# ── 時間 MLP ────────────────────────────────────────────────────
 
 class TimeMLP(nn.Module):
-    """Sinusoidal embedding → MLP → time conditioning."""
+    """正弦波埋め込み → MLP → 時間条件付け。"""
 
     def __init__(self, dim: int = 256):
         super().__init__()
@@ -68,7 +66,7 @@ class TimeMLP(nn.Module):
             nn.SiLU(),
             nn.Linear(dim, dim),
         )
-        # Zero-init last layer
+        # 最終層ゼロ初期化
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
@@ -76,10 +74,10 @@ class TimeMLP(nn.Module):
         return self.mlp(self.sinusoidal(t))
 
 
-# ── Cross-Attention to Speaker Prompt ──────────────────────────
+# ── 話者プロンプトへのクロスアテンション ─────────────────────────
 
 class SpeakerCrossAttn(nn.Module):
-    """Cross-attention from converter hidden states to speaker prompt tokens."""
+    """変換器隠れ状態から話者プロンプトトークンへのクロスアテンション。"""
 
     def __init__(self, dim: int = 512, prompt_dim: int = 192, n_heads: int = 4):
         super().__init__()
@@ -87,14 +85,12 @@ class SpeakerCrossAttn(nn.Module):
         self.norm_kv = nn.LayerNorm(prompt_dim)
         self.proj_kv = nn.Linear(prompt_dim, dim * 2)  # K, V
         self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
-        # Zero-init output projection
+        # ゼロ初期化出力射影
         self.out_proj = nn.Linear(dim, dim)
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
 
-    def forward(
-        self, x: torch.Tensor, prompt: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, prompt: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: (B, T, dim)
@@ -104,16 +100,16 @@ class SpeakerCrossAttn(nn.Module):
         """
         q = self.norm_q(x)
         kv = self.norm_kv(prompt)
-        k, v = self.proj_kv(kv).chunk(2, dim=-1)  # each (B, n_tokens, dim)
+        k, v = self.proj_kv(kv).chunk(2, dim=-1)  # 各 (B, n_tokens, dim)
 
         attn_out, _ = self.attn(q, k, v)
         return x + self.out_proj(attn_out)
 
 
-# ── Flow Block (ConvNeXt v2 + AdaLN-Zero + Cross-Attn) ────────
+# ── フローブロック (ConvNeXt v2 + AdaLN-Zero + クロスアテンション) ─
 
 class FlowBlock(nn.Module):
-    """Single block of the vector field network."""
+    """ベクトル場ネットワークの単一ブロック。"""
 
     def __init__(
         self,
@@ -127,7 +123,7 @@ class FlowBlock(nn.Module):
         self.dwconv = CausalConv1d(dim, dim, kernel_size, dilation=dilation, groups=dim)
         self.adaln = AdaLNZero(dim, cond_dim)
 
-        # MLP (inverted bottleneck + GRN)
+        # MLP（逆ボトルネック + GRN）
         hidden = dim * mlp_expansion
         self.pwconv1 = nn.Linear(dim, hidden)
         self.act = nn.GELU()
@@ -137,17 +133,15 @@ class FlowBlock(nn.Module):
         # LayerScale
         self.gamma = nn.Parameter(torch.zeros(1, 1, dim))
 
-    def forward(
-        self, x: torch.Tensor, cond: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (B, T, dim)  — hidden state
-            cond: (B, T, cond_dim) — time + speaker + prosody
+            x: (B, T, dim) — 隠れ状態
+            cond: (B, T, cond_dim) — 時間 + 話者 + 韻律
         Returns:
             (B, T, dim)
         """
-        # DWConv (channel-first)
+        # DWConv（チャネルファースト）
         h = x.transpose(1, 2)  # (B, dim, T)
         h = self.dwconv(h)
         h = h.transpose(1, 2)  # (B, T, dim)
@@ -158,41 +152,37 @@ class FlowBlock(nn.Module):
         # MLP
         h = self.pwconv1(h)
         h = self.act(h)
-        h = h.transpose(1, 2)  # (B, hidden, T) for GRN
+        h = h.transpose(1, 2)  # (B, hidden, T) GRN用
         h = self.grn(h)
         h = h.transpose(1, 2)  # (B, T, hidden)
         h = self.pwconv2(h)
 
-        # LayerScale + gate
+        # LayerScale + ゲート
         h = self.gamma * h * gate.sigmoid()
 
         return x + h
 
 
-# Need this import for FlowBlock
-from .blocks import CausalConv1d
-
-
-# ── Vector Field Network ───────────────────────────────────────
+# ── ベクトル場ネットワーク ──────────────────────────────────────
 
 class VectorFieldNet(nn.Module):
     """
-    v_θ(z_t, t, c) — predicts velocity field for CFM.
+    v_θ(z_t, t, c) — CFMの速度場を予測。
     
-    12 FlowBlocks with cyclic dilations + cross-attn at layers [3,6,9].
+    12個のFlowBlock（巡回ダイレーション）+ 層[3,6,9]でのクロスアテンション。
     """
 
     def __init__(self, cfg: FlowConverterConfig):
         super().__init__()
         self.cfg = cfg
 
-        # Input projection
+        # 入力射影
         self.in_proj = nn.Linear(cfg.latent_dim, cfg.hidden_dim)
 
-        # Time embedding
+        # 時間埋め込み
         self.time_mlp = TimeMLP(cfg.time_dim)
 
-        # Condition projection: speaker(192) + prosody(3) → cond_dim
+        # 条件射影: 話者(192) + 韻律(3) → cond_dim
         cond_in = cfg.speaker_dim + cfg.prosody_dim
         self.cond_proj = nn.Sequential(
             nn.Linear(cond_in, cfg.cond_dim),
@@ -200,11 +190,10 @@ class VectorFieldNet(nn.Module):
             nn.Linear(cfg.cond_dim, cfg.cond_dim),
         )
 
-        # AdaLN condition = cond_proj(frame) + time_emb(broadcast)
-        # Concatenated: (B, T, cond_dim + time_dim)
+        # AdaLN条件 = cond_proj(フレーム) + time_emb(ブロードキャスト)
         adaln_cond_dim = cfg.cond_dim + cfg.time_dim
 
-        # Flow blocks
+        # フローブロック
         self.blocks = nn.ModuleList([
             FlowBlock(
                 dim=cfg.hidden_dim,
@@ -216,7 +205,7 @@ class VectorFieldNet(nn.Module):
             for d in cfg.dilations
         ])
 
-        # Cross-attention modules
+        # クロスアテンションモジュール
         self.cross_attns = nn.ModuleDict()
         if cfg.use_cross_attn:
             for layer_idx in cfg.cross_attn_layers:
@@ -226,110 +215,79 @@ class VectorFieldNet(nn.Module):
                     n_heads=cfg.cross_attn_heads,
                 )
 
-        # Output projection
+        # 出力射影
         self.out_proj = nn.Linear(cfg.hidden_dim, cfg.latent_dim)
-        self.out_gate = nn.Parameter(torch.zeros(1))  # zero-init → identity
+        self.out_gate = nn.Parameter(torch.zeros(1))  # ゼロ初期化 → 恒等写像
 
     def _assemble_cond(
-        self,
-        t: torch.Tensor,
-        speaker_emb: torch.Tensor,
-        prosody: torch.Tensor | None,
-        T: int,
+        self, t: torch.Tensor, speaker_emb: torch.Tensor,
+        prosody: torch.Tensor | None, T: int,
     ) -> torch.Tensor:
-        """
-        Build per-frame condition from time, speaker, prosody.
-        Returns: (B, T, cond_dim + time_dim)
-        """
+        """時間・話者・韻律からフレーム単位条件を構築。"""
         B = speaker_emb.size(0)
 
-        # Time embedding → broadcast to all frames
+        # 時間埋め込み → 全フレームにブロードキャスト
         t_emb = self.time_mlp(t)  # (B, time_dim)
         t_emb = t_emb.unsqueeze(1).expand(-1, T, -1)  # (B, T, time_dim)
 
-        # Speaker + prosody per-frame condition
+        # 話者 + 韻律のフレーム単位条件
         spk = speaker_emb.unsqueeze(1).expand(-1, T, -1)  # (B, T, speaker_dim)
         if prosody is not None:
-            # Trim or pad prosody to match T
             if prosody.size(1) != T:
                 if prosody.size(1) > T:
                     prosody = prosody[:, :T, :]
                 else:
                     prosody = F.pad(prosody, (0, 0, 0, T - prosody.size(1)))
-            cond_cat = torch.cat([spk, prosody], dim=-1)  # (B, T, speaker+prosody)
+            cond_cat = torch.cat([spk, prosody], dim=-1)
         else:
             cond_cat = spk
 
         cond = self.cond_proj(cond_cat)  # (B, T, cond_dim)
-
         return torch.cat([cond, t_emb], dim=-1)  # (B, T, cond_dim + time_dim)
 
     def forward(
-        self,
-        z_t: torch.Tensor,
-        t: torch.Tensor,
+        self, z_t: torch.Tensor, t: torch.Tensor,
         speaker_emb: torch.Tensor,
         prompt_tokens: torch.Tensor | None = None,
         prosody: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
-            z_t: (B, T, latent_dim) current latent state
-            t: (B,) or (B, 1) time in [0, 1]
-            speaker_emb: (B, speaker_dim) target speaker
-            prompt_tokens: (B, n_tokens, prompt_dim) for cross-attn
-            prosody: (B, T_prosody, 3) source prosody
+            z_t: (B, T, latent_dim) 現在の潜在状態
+            t: (B,) または (B, 1) 時間 ∈ [0, 1]
+            speaker_emb: (B, speaker_dim) ターゲット話者
+            prompt_tokens: (B, n_tokens, prompt_dim) クロスアテンション用
+            prosody: (B, T_prosody, 3) ソース韻律
         Returns:
-            v: (B, T, latent_dim) velocity field
+            v: (B, T, latent_dim) 速度場
         """
         B, T_lat, _ = z_t.shape
 
-        # Input projection
         x = self.in_proj(z_t)  # (B, T, 512)
-
-        # Assemble condition
         cond = self._assemble_cond(t, speaker_emb, prosody, T_lat)
 
-        # Flow blocks
         for i, block in enumerate(self.blocks):
-            # Cross-attention before block (if configured)
             layer_idx = i + 1
             if str(layer_idx) in self.cross_attns and prompt_tokens is not None:
                 x = self.cross_attns[str(layer_idx)](x, prompt_tokens)
-
             x = block(x, cond)
 
-        # Output
         v = self.out_proj(x)
-        v = v * self.out_gate  # zero-init → identity
-
+        v = v * self.out_gate  # ゼロ初期化 → 恒等写像
         return v
 
 
-# ── ODE Solver ─────────────────────────────────────────────────
+# ── ODE ソルバ ──────────────────────────────────────────────────
 
 def solve_cfm_euler(
-    vfn: VectorFieldNet,
-    z_src: torch.Tensor,
-    speaker_emb: torch.Tensor,
-    prompt_tokens: torch.Tensor | None,
-    prosody: torch.Tensor | None,
+    vfn: VectorFieldNet, z_src: torch.Tensor, speaker_emb: torch.Tensor,
+    prompt_tokens: torch.Tensor | None, prosody: torch.Tensor | None,
     n_steps: int = 4,
 ) -> torch.Tensor:
     """
-    Solve CFM ODE using Euler method.
+    Euler法によるCFM ODEの求解。
     
     z_tgt = z_src + Σ v_θ(z_i, t_i, c) * dt
-    
-    Args:
-        vfn: VectorFieldNet
-        z_src: (B, T, latent_dim)
-        speaker_emb: (B, speaker_dim)
-        prompt_tokens: (B, n_tokens, prompt_dim)
-        prosody: (B, T, 3)
-        n_steps: number of Euler steps (4 default)
-    Returns:
-        z_tgt: (B, T, latent_dim)
     """
     z = z_src
     dt = 1.0 / n_steps
@@ -343,16 +301,13 @@ def solve_cfm_euler(
 
 
 def solve_cfm_rk4(
-    vfn: VectorFieldNet,
-    z_src: torch.Tensor,
-    speaker_emb: torch.Tensor,
-    prompt_tokens: torch.Tensor | None,
-    prosody: torch.Tensor | None,
+    vfn: VectorFieldNet, z_src: torch.Tensor, speaker_emb: torch.Tensor,
+    prompt_tokens: torch.Tensor | None, prosody: torch.Tensor | None,
     n_steps: int = 4,
 ) -> torch.Tensor:
     """
-    Solve CFM ODE using RK4 (4th-order Runge-Kutta).
-    Higher quality, 2× cost vs Euler.
+    RK4（4次ルンゲクッタ）によるCFM ODEの求解。
+    Eulerより高品質、2倍の計算コスト。
     """
     z = z_src
     dt = 1.0 / n_steps
@@ -373,7 +328,7 @@ def solve_cfm_rk4(
     return z
 
 
-# ── Factory ────────────────────────────────────────────────────
+# ── ファクトリ ──────────────────────────────────────────────────
 
 def make_vector_field_net(**kwargs) -> VectorFieldNet:
     cfg = FlowConverterConfig(**kwargs)
