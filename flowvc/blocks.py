@@ -202,7 +202,7 @@ class AdaLNZero(nn.Module):
 # ── FiLM（デコーダ条件付け用）───────────────────────────────────
 
 class FiLM(nn.Module):
-    """ゼロ初期化付き特徴量線形変調。"""
+    """Feature-wise Linear Modulation with zero-init."""
 
     def __init__(self, dim: int, cond_dim: int):
         super().__init__()
