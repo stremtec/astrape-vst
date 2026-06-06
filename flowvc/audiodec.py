@@ -62,8 +62,8 @@ class AudioDecEncoder(nn.Module):
         B = wav.size(0)
         z_list = []
         for b in range(B):
-            wb = wav[b, 0]  # (T,)
-            z = self._codec.encode(wb)  # (T_lat, 64)
+            wb = wav[b, 0].to(self.device)  # ensure correct device
+            z = self._codec.encode(wb)
             z_list.append(z)
         return torch.stack(z_list, dim=0)
 
@@ -103,7 +103,7 @@ class AudioDecDecoder(nn.Module):
         B = z.size(0)
         wav_list = []
         for b in range(B):
-            zb = z[b]  # (T_lat, 64)
+            zb = z[b].to(self.device)
             w = self._codec.decode(zb)  # (T_audio,)
             wav_list.append(w.unsqueeze(0))
         return torch.stack(wav_list, dim=0).unsqueeze(1)  # (B, 1, T_audio)
