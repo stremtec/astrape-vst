@@ -48,8 +48,13 @@ class FCPEProsodyExtractor(nn.Module):
             f0 = self._fcpe_model.infer(w16, sr=FCPE_SR, decoder_mode="local_argmax", threshold=0.006)
             f0 = f0.to(self.device)  # (1, Tf)
 
-            # Resample F0 to 25Hz
-            f0_25 = self._resampler_25hz(f0.unsqueeze(0)).squeeze(0).squeeze(0)  # (T25,)
+            # Resample F0 to 25Hz using nearest-neighbor (avoids sinc ringing on pitch contour)
+            f0_np = f0.squeeze(0).cpu().numpy() if f0.is_cuda or f0.device.type == "mps" else f0.squeeze(0).numpy()
+            import numpy as np
+            old_len = len(f0_np)
+            new_len = max(1, int(old_len * TARGET_HZ / 100))
+            indices = np.linspace(0, old_len - 1, new_len).round().astype(int)
+            f0_25 = torch.from_numpy(f0_np[indices]).to(self.device)
             if f0_25.dim() == 0:
                 f0_25 = f0_25.unsqueeze(0)
             elif f0_25.dim() == 2:

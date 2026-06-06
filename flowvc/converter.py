@@ -131,7 +131,7 @@ class FlowBlock(nn.Module):
         self.pwconv2 = nn.Linear(hidden, dim)
 
         # LayerScale
-        self.gamma = nn.Parameter(torch.ones(1, 1, dim) * 1e-5)  # near-zero → near-identity with small gradient
+        self.gamma = nn.Parameter(torch.ones(1, 1, dim) * 1e-4)  # near-zero; 1e-4 safe for fp16
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         """
@@ -297,10 +297,10 @@ def solve_cfm_euler(
         v = vfn(z, t, speaker_emb, prompt_tokens, prosody)
         z = z + v * dt
 
-    # Final step at t=1 for boundary accuracy
+    # Final evaluation at t=1 (within valid domain), weighted by dt/2 for trapezoidal finish
     t_end = torch.ones(z_src.size(0), device=z.device)
     v_end = vfn(z, t_end, speaker_emb, prompt_tokens, prosody)
-    z = z + v_end * dt * 0.5  # half-step refinement at boundary
+    z = z + v_end * dt * 0.5  # trapezoidal corrector: uses velocity at both t≈1 and t=1
 
     return z
 

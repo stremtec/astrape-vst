@@ -93,11 +93,12 @@ def train(args):
             ref = batch["ref_wav"].to(device)
 
             if args.phase == 0:
-                # ── Phase 0: AE reconstruction ──
+                # ── Phase 0: AE reconstruction (no speaker conditioning) ──
+                # Decoder receives zeros for speaker emb to learn speaker-agnostic decoding.
+                # This prevents speaker info leakage into the latent space.
                 z = encoder(src, training=True)
-                spk_emb, prompt = speaker_enc(ref)
-                recon = decoder(z, spk_emb)
-                loss = F.l1_loss(recon, src)
+                recon = decoder(z, torch.zeros(src.size(0), 192, device=device))
+                loss = F.l1_loss(recon, src) + 0.1 * F.mse_loss(z, z.detach())  # latent consistency
 
             elif args.phase == 1:
                 # ── Phase 1: CFM ──

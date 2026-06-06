@@ -64,7 +64,7 @@ class DecoderStage(nn.Module):
         kernel_size: int = 7, mrf_config: dict | None = None,
     ):
         super().__init__()
-        stride_kernel = stride * 2 + 1  # 十分なカバレッジを確保
+        stride_kernel = stride * 3  # kernel must be multiple of stride to avoid checkerboard
         self.upsample = CausalConvTranspose1d(
             in_ch, out_ch, kernel_size=stride_kernel, stride=stride
         )

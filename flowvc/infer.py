@@ -7,7 +7,7 @@ import argparse, time, torch, torch.nn.functional as F, torchaudio
 
 from .encoder import F3Encoder, make_encoder
 from .decoder import F3Decoder
-from .converter import VectorFieldNet, solve_cfm_euler
+from .converter import VectorFieldNet, solve_cfm_euler, make_vector_field_net
 from .speaker import SpeakerEncoder, make_speaker_encoder
 from .prosody import FCPEProsodyExtractor, make_prosody_extractor
 from .config import DecoderConfig
@@ -16,10 +16,8 @@ from .config import DecoderConfig
 class FlowVCInference:
     """Streaming VC with ring buffer + overlap-add."""
 
-    def __init__(
-        self, encoder, decoder, vfn, speaker_enc, prosody_ext,
-        device="cpu", chunk_ms=80, left_ctx_ms=320, overlap_ms=20, ode_steps=4,
-    ):
+    def __init__(self, encoder, decoder, vfn, speaker_enc, prosody_ext,
+                 device="cpu", chunk_ms=80, left_ctx_ms=320, overlap_ms=40, ode_steps=4):
         self.device = torch.device(device)
         self.encoder = encoder.to(self.device).eval()
         self.decoder = decoder.to(self.device).eval()
@@ -60,6 +58,10 @@ class FlowVCInference:
         t0 = time.time()
 
         chunk = chunk.to(self.device).unsqueeze(0).unsqueeze(0)  # (1, 1, T)
+
+        # Cold-start: on first chunk, fill buffer with audio to avoid silence context
+        if self.stats["chunks"] == 0:
+            self.buffer = chunk.repeat(1, 1, max(1, self.buffer.shape[2] // max(chunk.shape[2], 1)))[:, :, :self.buffer.shape[2]]
 
         # Prepend left context from ring buffer
         ctx = torch.cat([self.buffer, chunk], dim=-1)  # (1, 1, ctx+T)
