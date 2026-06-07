@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import argparse
 import sys
+import os
+
+# Ensure codex_vc is importable
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import soundfile as sf
 import torch
