@@ -99,22 +99,19 @@ class CachedMimiDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         entry = self.index[idx]
         data = torch.load(self.cache_dir / entry["path"], map_location="cpu", weights_only=True)
-        # Extract utterance ID from filename: p225_001_mic1 → 001
-        fname = Path(entry["path"]).stem
-        utt_id = fname.split("_")[1] if "_" in fname else fname
-        return data["z"], entry["speaker"], utt_id
+        return data["z"], entry["speaker"]
 
 
 def collate_varlen(batch):
     """Collate variable-length Mimi latents by padding to max length."""
-    zs, speakers, utt_ids = zip(*batch)
+    zs, speakers = zip(*batch)
     max_T = max(z.shape[1] for z in zs)
     padded = []
     for z in zs:
         if z.shape[1] < max_T:
             z = F.pad(z, (0, max_T - z.shape[1]))
         padded.append(z)
-    return torch.stack(padded, dim=0), list(speakers), list(utt_ids)
+    return torch.stack(padded, dim=0), list(speakers)
 
 
 def train_splitter(args):
@@ -147,14 +144,15 @@ def train_splitter(args):
         for batch in loader:
             if step >= args.steps: break
 
-            z_batch, speakers, utt_ids = batch
+            z_batch, speakers = batch
             B = z_batch.size(0)
 
-            # Create cross-speaker pairs: SAME text, DIFFERENT speaker (for content invariance)
+            # Create cross-speaker pairs within batch
             z_src, z_tgt = [], []
             for i in range(B):
+                # Find a different speaker in the batch
                 for j in range(B):
-                    if speakers[j] != speakers[i] and utt_ids[j] == utt_ids[i]:
+                    if speakers[j] != speakers[i]:
                         z_src.append(z_batch[i:i+1])
                         z_tgt.append(z_batch[j:j+1])
                         break
