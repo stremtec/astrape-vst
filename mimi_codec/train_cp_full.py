@@ -112,8 +112,12 @@ STRIDE = 1920
 def load(path, dur=2):
     data, sr = sf.read(path)
     if sr != 24000: data = signal.resample(data, int(len(data)*24000/sr), axis=0)
-    L = dur * 24000 - (dur * 24000 % STRIDE)
-    data = data[:L]
+    if dur is not None:
+        L = dur * 24000 - (dur * 24000 % STRIDE)
+        data = data[:L]
+    else:
+        L = len(data) - (len(data) % STRIDE)
+        data = data[:L]
     if data.ndim > 1: data = data.mean(axis=1)
     return torch.from_numpy(data).float().unsqueeze(0).unsqueeze(0)
 
