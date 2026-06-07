@@ -105,7 +105,7 @@ class AudioDecDecoder(nn.Module):
         for b in range(B):
             zb = z[b].to(self.device)
             w = self._codec.decode(zb)  # (T_audio,)
-            wav_list.append(w.unsqueeze(0))
+            wav_list.append(w)
         return torch.stack(wav_list, dim=0).unsqueeze(1)  # (B, 1, T_audio)
 
 
