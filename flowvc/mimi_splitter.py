@@ -109,11 +109,10 @@ def splitter_loss(
     s_src_exp = s_src.expand(-1, -1, T)
     s_tgt_exp = s_tgt.expand(-1, -1, T)
 
-    # Reconstruction: decode from src content + src speaker
+    # Reconstruction: decode from src content + src speaker (keep on gradient path!)
     z_recon = c_src + s_src_exp
-    with torch.no_grad():
-        codes = mimi.quantizer.encode(z_recon.transpose(1, 2))
-        audio_recon = mimi.decode(codes)
+    codes = mimi.quantizer.encode(z_recon.transpose(1, 2))
+    audio_recon = mimi.decode(codes)
     recon_loss = F.l1_loss(audio_recon, audio_src)
 
     # Content invariance: src content ≈ tgt content (same text!)
