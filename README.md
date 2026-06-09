@@ -1,88 +1,86 @@
-# Astrape VC 
+# Astrape VC
 
+**Real-time zero-shot voice conversion via MioCodec teacher-student distillation.**
 
-STILL WORKING!!!
+> **Αστραπή** (Astrape) — Greek for "lightning"
 
-The architecture may change at any time, but the overall direction will not change.
-
-> **Αστραπή** (アストラペー) — ギリシャ語で「稲妻」
-
-Conditional Flow Matching によるリアルタイムニューラル音声変換。  
-完全因果的パイプライン。44.1kHz。MioCodec非依存。
+## Architecture
 
 ```
-ソース(44.1k) → F³-Encoder(因果的, KLフリー) → z_src
-  → FlowVC Converter(CFM ODE, 4-8ステップ)
-  → F³-Decoder(因果的, MRFアップサンプラ) → ターゲット(44.1k)
+Source (44.1kHz)
+  → Causal Content Student (Transformer, 25Hz)
+  → Content Embedding [T, 768]
+  → Causal AdaLN-Zero Mel Decoder
+  + Cached Target Global Embedding [128]
+  → Teacher Wave Decoder / Vocoder
+  → Target Voice (44.1kHz)
 ```
 
-## アーキテクチャ
-
-| コンポーネント | パラメータ | 説明 |
+| Component | Params | Description |
 |-----------|:------:|-------------|
-| F³-Encoder | 26.5M | 6段因果的ConvNeXt v2, KLフリー, ノイズ正則化 |
-| VectorFieldNet | 37.2M | 12ブロックCFM変換器, AdaLN-Zero, クロスアテンション |
-| F³-Decoder | 27.9M | 6段MRFアップサンプラ, FiLM条件付け |
-| **合計** | **91.6M** | 完全因果的, ストリーミング対応 |
+| Causal Content Student v2 | ~4M | Causal Transformer encoder, mel→content embedding distillation |
+| Content Student v1 (baseline) | ~1M | Mel+TCN encoder, FSQ 5-dim target |
+| Causal Mel Decoder | ~3M | AdaLN-Zero speaker-conditioned, self-attention |
+| MioCodec Teacher (offline) | ~200M | WavLM + Transformer, non-causal, quality upper bound |
+| **Total Student** | **~7M** | Fully causal, streaming-capable |
 
-## 主要特徴
+## Key Features
 
-- **因果的ファースト**: 全畳み込みが左パディングのみ — 未来の情報漏洩なし
-- **Flow Matching**: OTパスによる条件付きフローマッチング, 4ステップEulerソルバ
-- **KLフリー**: VQなし, コードブック崩壊なし, 連続潜在空間
-- **ConvNeXt v2**: GRN, LayerScale, 逆ボトルネックを全体に採用
-- **44.1kHzネイティブ**: 帯域拡張不要
-- **Zero-init全般**: 初期化時に恒等写像, 安定した学習
+- **Zero-shot**: Target speaker from 1-3s reference audio, cached as 128d global embedding
+- **Causal-first**: All convolutions and attention are strictly causal — no future leakage
+- **Teacher-student**: MioCodec provides quality upper bound; student distilled for streaming
+- **Usable quality**: Jitter lower than teacher, content intelligibility confirmed
+- **44.1kHz native**: No bandwidth extension needed
+- **AdaLN-Zero conditioning**: Clean speaker/content separation
 
-## クイックスタート
+## Research Status
+
+| Milestone | Status |
+|-----------|--------|
+| MioCodec teacher VC quality confirmed | ✅ jitter 7.1%, crest 6.0 |
+| Target global embedding stable + cacheable | ✅ cos >0.99 under augmentation |
+| Causal Content Student v1 (TCN) | ✅ functional, cos 0.63, garbled content |
+| Causal Content Student v2 (Transformer) | ✅ cos 0.90 val, intelligible |
+| Causal Mel Decoder | ✅ content-driven, global works |
+| Global conditioning verified | ✅ tgt > src > other > zero |
+| Streaming vocoder | ⏳ not started |
+| End-to-end latency benchmark | ⏳ pending |
+
+## Quick Start
 
 ```bash
-# 形状テスト
+# Load pretrained student + teacher
 python3 -c "
-from flowvc.encoder import make_encoder
-from flowvc.converter import make_vector_field_net, solve_cfm_euler
-from flowvc.decoder import F3Decoder
-from flowvc.config import DecoderConfig
+from miocodec.model import MioCodecModel
 import torch
 
-encoder = make_encoder()
-vfn = make_vector_field_net()
-decoder = F3Decoder(DecoderConfig())
+# Teacher (quality reference, non-causal)
+teacher = MioCodecModel.from_pretrained('Aratako/MioCodec-25Hz-44.1kHz-v2')
 
-B, T_lat = 2, 50
-wav = torch.randn(B, 1, T_lat * 1764)  # 2秒 @ 44.1kHz
-spk = torch.randn(B, 192)
-prompt = torch.randn(B, 4, 192)
-prosody = torch.randn(B, T_lat, 3)
-
-z = encoder.encode(wav)
-z_tgt = solve_cfm_euler(vfn, z, spk, prompt, prosody)
-out = decoder(z_tgt, spk)
-
-assert out.shape == wav.shape
-print('✅ パイプラインOK')
+# Student models (causal, streaming)
+# checkpoints/causal_student_v2_final.pt  — 384dim Transformer
+# checkpoints/causal_mel_decoder.pt       — causal decoder
+# checkpoints/student_proj_out.pt         — content projection
 "
 ```
 
-## 設計
+## Documentation
 
-2026年arXiv音声論文22本の文献レビューに基づく。  
-詳細設計ドキュメントは `designs/` に格納。  
-5エージェント並列レビュー + スコアリングにより最優秀アーキテクチャを選定。
+```
+docs/research/
+├── mimi_splitter_vc_summary.md       # Mimi VC experiments (negative result)
+├── miocodec_internal_audit.md        # MioCodec deep structure analysis
+├── miocodec_causality_audit.md       # Non-causality root causes
+├── miocodec_vc_confirmed.md          # Teacher VC quality confirmation
+├── mio_causal_student_status.md      # Current student pipeline status
+└── mio_student_content_bottleneck.md # Content intelligibility diagnosis
+```
 
-## 状況
+## Branches
 
-- [x] F³-Encoder (因果的ConvNeXt v2)
-- [x] F³-Decoder (MRFアップサンプラ + FiLM)
-- [x] VectorFieldNet (CFM, 12ブロック)
-- [x] CFM Loss (OTパス + シグマ正則化)
-- [x] Euler/RK4 ODEソルバ
-- [x] 形状テスト合格 (91.6Mパラメータ)
-- [ ] 話者エンコーダ + プロンプトトークン
-- [ ] 韻律抽出器
-- [ ] 学習パイプライン
-- [ ] ストリーミング推論
+- `main` — FlowVC / F³ architecture (legacy)
+- `research_mio` — **Active**: MioCodec causal student distillation
 
-## ライセンス
+## License
 
 MIT
