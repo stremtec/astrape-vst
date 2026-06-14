@@ -1,86 +1,104 @@
 # Astrape VC
 
-**Real-time zero-shot voice conversion via MioCodec teacher-student distillation.**
+Research code for a causal, zero-shot voice-conversion pipeline distilled from
+MioCodec.
 
-> **Αστραπή** (Astrape) — Greek for "lightning"
+## Current Pipeline
 
-## Architecture
-
-```
-Source (44.1kHz)
-  → Causal Content Student (Transformer, 25Hz)
-  → Content Embedding [T, 768]
-  → Causal AdaLN-Zero Mel Decoder
-  + Cached Target Global Embedding [128]
-  → Teacher Wave Decoder / Vocoder
-  → Target Voice (44.1kHz)
+```text
+16 kHz source PCM
+  -> streaming log-mel, 50 Hz
+  -> strictly causal ContentStudent
+  -> content embedding, 768d at 25 Hz
+  -> CausalMelDecoder + cached target global embedding, 128d
+  -> mel, 80 bins at 25 Hz
 ```
 
-| Component | Params | Description |
-|-----------|:------:|-------------|
-| Causal Content Student v2 | ~4M | Causal Transformer encoder, mel→content embedding distillation |
-| Content Student v1 (baseline) | ~1M | Mel+TCN encoder, FSQ 5-dim target |
-| Causal Mel Decoder | ~3M | AdaLN-Zero speaker-conditioned, self-attention |
-| MioCodec Teacher (offline) | ~200M | WavLM + Transformer, non-causal, quality upper bound |
-| **Total Student** | **~7M** | Fully causal, streaming-capable |
+The source-to-mel path supports stateful streaming and has regression tests
+that compare chunked output against full-sequence output. Waveform synthesis is
+still a research dependency: `demo_v2.py` can use MioCodec's offline teacher
+decoder, while a production causal vocoder has not yet been trained.
 
-## Key Features
+## Models
 
-- **Zero-shot**: Target speaker from 1-3s reference audio, cached as 128d global embedding
-- **Causal-first**: All convolutions and attention are strictly causal — no future leakage
-- **Teacher-student**: MioCodec provides quality upper bound; student distilled for streaming
-- **Usable quality**: Jitter lower than teacher, content intelligibility confirmed
-- **44.1kHz native**: No bandwidth extension needed
-- **AdaLN-Zero conditioning**: Clean speaker/content separation
+- `astrape.model.ContentStudent`: left-padded causal convolutions, causal
+  attention, aligned 50 Hz to 25 Hz downsampling, streaming state.
+- `astrape.mel_decoder.CausalMelDecoder`: source-restored AdaLN-Zero decoder
+  matching `checkpoints/causal_mel_decoder.pt`.
+- `astrape.audio.StreamingLogMel`: exact `center=False` full/chunked log-mel
+  extraction for 16 kHz PCM.
 
-## Research Status
+Existing `checkpoints/causal_student_v3_4k.pt` was trained by the old
+symmetrically padded architecture. It is therefore treated as a legacy weight
+file and requires `--allow-legacy` or `--import-legacy`. Fine-tune it with the
+new causal architecture before reporting causal quality.
 
-| Milestone | Status |
-|-----------|--------|
-| MioCodec teacher VC quality confirmed | ✅ jitter 7.1%, crest 6.0 |
-| Target global embedding stable + cacheable | ✅ cos >0.99 under augmentation |
-| Causal Content Student v1 (TCN) | ✅ functional, cos 0.63, garbled content |
-| Causal Content Student v2 (Transformer) | ✅ cos 0.90 val, intelligible |
-| Causal Mel Decoder | ✅ content-driven, global works |
-| Global conditioning verified | ✅ tgt > src > other > zero |
-| Streaming vocoder | ⏳ not started |
-| End-to-end latency benchmark | ⏳ pending |
-
-## Quick Start
+## Training
 
 ```bash
-# Load pretrained student + teacher
-python3 -c "
-from miocodec.model import MioCodecModel
-import torch
+# Standard 384d model
+.venv/bin/python train_v3_4k.py
 
-# Teacher (quality reference, non-causal)
-teacher = MioCodecModel.from_pretrained('Aratako/MioCodec-25Hz-44.1kHz-v2')
+# Short run with a separate checkpoint name
+.venv/bin/python train_v3_4k_mini.py
 
-# Student models (causal, streaming)
-# checkpoints/causal_student_v2_final.pt  — 384dim Transformer
-# checkpoints/causal_mel_decoder.pt       — causal decoder
-# checkpoints/student_proj_out.pt         — content projection
-"
+# Configured capacity tier
+.venv/bin/python train_xhigh.py --tier xhigh --device mps
+
+# Causal mel decoder
+.venv/bin/python train_mel_decoder.py --target-mode teacher
 ```
 
-## Documentation
+Training uses speaker-disjoint validation, aligned even-frame crops, masked
+variable-length losses, deterministic seeds, full validation, versioned
+checkpoints, and separate `.best.pt`/`.last.pt` files.
 
+To import the historical student weights:
+
+```bash
+.venv/bin/python train_v3_4k.py \
+  --import-legacy checkpoints/causal_student_v3_4k.pt
 ```
-docs/research/
-├── mimi_splitter_vc_summary.md       # Mimi VC experiments (negative result)
-├── miocodec_internal_audit.md        # MioCodec deep structure analysis
-├── miocodec_causality_audit.md       # Non-causality root causes
-├── miocodec_vc_confirmed.md          # Teacher VC quality confirmation
-├── mio_causal_student_status.md      # Current student pipeline status
-└── mio_student_content_bottleneck.md # Content intelligibility diagnosis
+
+## Extraction
+
+```bash
+.venv/bin/python extract_4k.py \
+  --vctk-root /path/to/VCTK/wav48_silence_trimmed
 ```
 
-## Branches
+Extraction randomly samples utterances per speaker with a fixed seed and stores
+speaker names, utterance IDs, and source paths in `meta.npz`. MioCodec is an
+optional external dependency required for extraction and teacher decoding.
 
-- `main` — FlowVC / F³ architecture (legacy)
-- `research_mio` — **Active**: MioCodec causal student distillation
+## Inference And Benchmarking
 
-## License
+```bash
+# Incremental content + mel inference on cached data
+.venv/bin/python stream_infer.py \
+  --mel data/mio_4k_mel/m_00000.npz \
+  --target data/mio_4k/s_00001.npz \
+  --checkpoint checkpoints/content_student_v3_4k_causal.best.pt \
+  --mel-decoder checkpoints/causal_mel_decoder.pt
 
-MIT
+# Synchronized accelerator benchmark
+.venv/bin/python bench_dim.py --device mps
+
+# Offline waveform comparison through the MioCodec teacher decoder
+.venv/bin/python demo_v2.py \
+  --source source.wav --reference target.wav
+```
+
+Benchmark timings synchronize MPS/CUDA before and after every measurement and
+report full-sequence latency, streaming latency per 25 Hz content frame, and
+real-time factor.
+
+## Tests
+
+```bash
+.venv/bin/python -m unittest discover -v
+```
+
+The suite covers causal prefix invariance, streaming equivalence, log-mel
+streaming, speaker-disjoint splitting, crop alignment, padding masks,
+checkpoint compatibility, decoder loading, and tier construction.

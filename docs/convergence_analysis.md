@@ -1,5 +1,7 @@
 # 3-Phase学習 収束・最適化ダイナミクス分析
 
+> Legacy note: this document describes the removed FlowVC/F³ training system.
+
 **エージェント #4: 学習収束・最適化ダイナミクス**  
 **対象ファイル**: `train.py`, `cfm_loss.py`, `converter.py`  
 **分析日**: 2026-06-06

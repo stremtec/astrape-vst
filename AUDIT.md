@@ -1,5 +1,8 @@
 # FlowVC 코드 감사 — 종합 보고서
 
+> Legacy note: this report audits the removed FlowVC/F³ implementation, not the
+> current `astrape/` MioCodec student code.
+
 > 2026-06-06 | 3개 병렬 에이전트 | 10개 파일 전수 감사
 
 ---

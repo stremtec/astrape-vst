@@ -1,132 +1,126 @@
 #!/usr/bin/env python3
-"""V2 Demo: Transformer content student → decoder → waveform."""
-import torch, numpy as np, soundfile as sf, glob, torchaudio, math, os
-from scipy import signal as scipy_signal
-SR=44100
-import torch.nn as nn
+"""Offline teacher-decoder demo using the current content student."""
 
-class PositionalEncoding(nn.Module):
-    def __init__(self,dim,max_len=2000):
-        super().__init__(); pe=torch.zeros(max_len,dim)
-        pos=torch.arange(0,max_len).unsqueeze(1).float()
-        div=torch.exp(torch.arange(0,dim,2).float()*(-math.log(10000.0)/dim))
-        pe[:,0::2]=torch.sin(pos*div); pe[:,1::2]=torch.cos(pos*div)
-        self.register_buffer('pe',pe.unsqueeze(0))
-    def forward(self,x): T=x.size(1); return x+self.pe[:,:T,:].contiguous()
-class CausalTransformerBlock(nn.Module):
-    def __init__(self,dim=384,n_heads=6,ff_mult=4,dropout=0.1):
-        super().__init__()
-        self.norm1=nn.LayerNorm(dim); self.attn=nn.MultiheadAttention(dim,n_heads,dropout=dropout,batch_first=True)
-        self.norm2=nn.LayerNorm(dim); self.ff=nn.Sequential(nn.Linear(dim,dim*ff_mult),nn.GELU(),nn.Dropout(dropout),nn.Linear(dim*ff_mult,dim),nn.Dropout(dropout))
-    def forward(self,x):
-        T=x.shape[1]; mask=torch.tril(torch.ones(T,T,device=x.device,dtype=torch.bool))
-        xn=self.norm1(x); a=self.attn(xn,xn,xn,attn_mask=~mask,need_weights=False)[0]; x=x+a
-        xn=self.norm2(x); x=x+self.ff(xn); return x
-class ContentStudentV2(nn.Module):
-    def __init__(self,in_dim=80,hidden=384,n_layers=6,n_heads=6,out_dim=5,kernel=5):
-        super().__init__()
-        self.stem=nn.Sequential(nn.Conv1d(in_dim,hidden,kernel,padding=kernel//2),nn.GELU(),nn.Conv1d(hidden,hidden,kernel,padding=kernel//2),nn.GELU())
-        self.pos_enc=PositionalEncoding(hidden)
-        self.blocks=nn.ModuleList([CausalTransformerBlock(hidden,n_heads) for _ in range(n_layers)])
-        self.norm=nn.LayerNorm(hidden); self.down=nn.Conv1d(hidden,hidden,3,stride=2,padding=1)
-        self.content_head=nn.Conv1d(hidden,768,1)
-    def forward(self,x):
-        h=self.stem(x); h=h.transpose(1,2); h=self.pos_enc(h)
-        for block in self.blocks: h=block(h)
-        h=self.norm(h).transpose(1,2); h=self.down(h)
-        return self.content_head(h)
+import argparse
+import math
+from pathlib import Path
 
-# Load
-stu=ContentStudentV2(hidden=256,n_layers=4,n_heads=4)
-stu.load_state_dict(torch.load('checkpoints/causal_student_v2.pt',map_location='cpu'),strict=False); stu.eval()
-for p in stu.parameters(): p.requires_grad=False
+import numpy as np
+import soundfile as sf
+import torch
+from scipy.signal import resample_poly
 
-from miocodec.model import MioCodecModel
-teacher=MioCodecModel.from_pretrained('Aratako/MioCodec-25Hz-44.1kHz-v2'); teacher.eval()
+from astrape.audio import StreamingLogMel
+from astrape.checkpoint import load_content_checkpoint
+from astrape.mel_decoder import load_mel_decoder
 
-ROOT='/Users/asill/asill/research2/datasets/vctk/wav48_silence_trimmed'
-OUT='/Users/asill/Desktop/mio_vc_demo_v2'
-os.makedirs(OUT,exist_ok=True)
 
-mel_in=torchaudio.transforms.MelSpectrogram(sample_rate=16000,n_fft=512,hop_length=320,n_mels=80,f_min=80,f_max=7600,center=False,power=2)
+OUTPUT_SAMPLE_RATE = 44100
 
-# Origin target
-d_origin,sr_o=sf.read('/Users/asill/Downloads/origin.mp3')
-if d_origin.ndim>1: d_origin=d_origin.mean(axis=1)
-if sr_o!=SR: d_origin=scipy_signal.resample(d_origin,int(len(d_origin)*SR/sr_o))
-sf.write(f'{OUT}/00_origin_target.wav',d_origin[:SR*5],SR)
 
-male_spks=['p255','p256','p258','p260','p262','p265','p270']
-for spk in male_spks:
-    files=glob.glob(f'{ROOT}/{spk}/{spk}_*_mic1.flac'); 
-    if not files: continue
-    d_src,sr=sf.read(files[0])
-    if d_src.ndim>1: d_src=d_src.mean(axis=1)
-    if sr!=SR: d_src=scipy_signal.resample(d_src,int(len(d_src)*SR/sr))
-    d_src=d_src[:SR*3]; alen=len(d_src)
-    x_s=torch.from_numpy(d_src).float().unsqueeze(0)
-    x_o=torch.from_numpy(d_origin[:SR*3]).float().unsqueeze(0)
-    
+def resample(audio: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
+    if source_rate == target_rate:
+        return audio
+    divisor = math.gcd(source_rate, target_rate)
+    return resample_poly(
+        audio, target_rate // divisor, source_rate // divisor
+    )
+
+
+def load_audio(path: Path, sample_rate: int, seconds: float) -> np.ndarray:
+    audio, source_rate = sf.read(path, always_2d=False)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    audio = resample(audio, source_rate, sample_rate)
+    return audio[: int(sample_rate * seconds)].astype(np.float32)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--reference", type=Path, required=True)
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=Path("checkpoints/content_student_v3_4k_causal.best.pt"),
+    )
+    parser.add_argument("--mel-decoder", type=Path)
+    parser.add_argument("--output-dir", type=Path, default=Path("outputs/demo"))
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--seconds", type=float, default=3.0)
+    parser.add_argument("--allow-legacy", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    try:
+        from miocodec.model import MioCodecModel
+    except ModuleNotFoundError as error:
+        raise SystemExit(
+            "MioCodec is required for waveform decoding. Install the package "
+            "that provides miocodec.model.MioCodecModel."
+        ) from error
+    device = torch.device(args.device)
+    student, _ = load_content_checkpoint(
+        args.checkpoint,
+        device=device,
+        allow_legacy=args.allow_legacy,
+    )
+    student.eval()
+    teacher = MioCodecModel.from_pretrained(
+        "Aratako/MioCodec-25Hz-44.1kHz-v2"
+    ).eval()
+    source = load_audio(args.source, OUTPUT_SAMPLE_RATE, args.seconds)
+    reference = load_audio(args.reference, OUTPUT_SAMPLE_RATE, args.seconds)
+    source_tensor = torch.from_numpy(source).unsqueeze(0)
+    reference_tensor = torch.from_numpy(reference).unsqueeze(0)
+    source_16k = resample(source, OUTPUT_SAMPLE_RATE, 16000)
+    logmel = StreamingLogMel()(torch.from_numpy(source_16k).float()).to(device)
+
     with torch.inference_mode():
-        fs=teacher.encode(x_s,return_content=True,return_global=True)
-        fo=teacher.encode(x_o,return_content=False,return_global=True)
-        ge_o=fo.global_embedding
-        
-        # Teacher VC
-        w_t=teacher.decode(global_embedding=ge_o,content_token_indices=fs.content_token_indices,target_audio_length=alen)
-        
-        # v2 Student VC
-        a16=scipy_signal.resample(d_src[:alen],int(alen*16000/SR))
-        mel=mel_in(torch.from_numpy(a16).float().view(1,1,-1))
-        lm=torch.log(mel.squeeze(1).clamp(min=1e-5))  # (1,80,T) — correct for Conv1d
-        ce_v2=stu(lm)  # (1,768,T)
-        w_s=teacher.decode(global_embedding=ge_o,content_embedding=ce_v2.squeeze(0).T,target_audio_length=alen)
-    
-    sf.write(f'{OUT}/{spk}_01_original.wav',d_src,SR)
-    sf.write(f'{OUT}/{spk}_02_teacher_vc.wav',w_t.numpy()[:alen],SR)
-    sf.write(f'{OUT}/{spk}_03_v2_student.wav',w_s.numpy()[:alen],SR)
-    print(f'{spk} done')
+        source_features = teacher.encode(
+            source_tensor, return_content=True, return_global=False
+        )
+        reference_features = teacher.encode(
+            reference_tensor, return_content=False, return_global=True
+        )
+        content = student(logmel).content.squeeze(0).transpose(0, 1).cpu()
+        teacher_waveform = teacher.decode(
+            global_embedding=reference_features.global_embedding,
+            content_token_indices=source_features.content_token_indices,
+            target_audio_length=len(source),
+        )
+        student_waveform = teacher.decode(
+            global_embedding=reference_features.global_embedding,
+            content_embedding=content,
+            target_audio_length=len(source),
+        )
 
-# Also generate with v1 hard FSQ for comparison
-class StudentV1(nn.Module):
-    def __init__(self,in_dim=80,hidden=256,out_dim=5,num_layers=4,kernel=5):
-        super().__init__()
-        self.proj_in=nn.Conv1d(in_dim,hidden,1)
-        layers=[]
-        for i in range(num_layers):
-            d=2**i; p=(kernel-1)*d
-            layers.append(nn.Sequential(nn.Conv1d(hidden,hidden,kernel,dilation=d,padding=p),nn.GroupNorm(8,hidden),nn.GELU(),nn.Conv1d(hidden,hidden,1)))
-        self.layers=nn.ModuleList(layers)
-        self.down=nn.Conv1d(hidden,hidden,3,stride=2,padding=1)
-        self.proj_out=nn.Conv1d(hidden,out_dim,1)
-    def forward(self,x):
-        h=self.proj_in(x)
-        for layer in self.layers: r=h; h=layer(h); h=h[:,:,:r.shape[2]]; h=h+r
-        h=self.down(h); return self.proj_out(h)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    sf.write(args.output_dir / "source.wav", source, OUTPUT_SAMPLE_RATE)
+    sf.write(
+        args.output_dir / "teacher_vc.wav",
+        teacher_waveform.cpu().numpy()[: len(source)],
+        OUTPUT_SAMPLE_RATE,
+    )
+    sf.write(
+        args.output_dir / "student_vc.wav",
+        student_waveform.cpu().numpy()[: len(source)],
+        OUTPUT_SAMPLE_RATE,
+    )
+    if args.mel_decoder is not None:
+        decoder = load_mel_decoder(args.mel_decoder, device).eval()
+        global_embedding = reference_features.global_embedding.unsqueeze(0).to(device)
+        predicted_mel = decoder(
+            content.unsqueeze(0).to(device), global_embedding
+        )
+        np.save(
+            args.output_dir / "student_mel.npy",
+            predicted_mel.squeeze(0).cpu().numpy(),
+        )
+    print(f"Outputs written to {args.output_dir}")
 
-stu_v1=StudentV1(); stu_v1.load_state_dict(torch.load('checkpoints/causal_student_v1.pt',map_location='cpu'),strict=False); stu_v1.eval()
-for p in stu_v1.parameters(): p.requires_grad=False
 
-for spk in ['p255','p256']:
-    files=glob.glob(f'{ROOT}/{spk}/{spk}_*_mic1.flac')
-    d_src,sr=sf.read(files[0])
-    if d_src.ndim>1: d_src=d_src.mean(axis=1)
-    if sr!=SR: d_src=scipy_signal.resample(d_src,int(len(d_src)*SR/sr))
-    d_src=d_src[:SR*3]; alen=len(d_src)
-    x_s=torch.from_numpy(d_src).float().unsqueeze(0)
-    with torch.inference_mode():
-        fs=teacher.encode(x_s,return_content=True,return_global=True)
-        fo=teacher.encode(torch.from_numpy(d_origin[:SR*3]).float().unsqueeze(0),return_content=False,return_global=True)
-        a16=scipy_signal.resample(d_src[:alen],int(alen*16000/SR))
-        mel2=mel_in(torch.from_numpy(a16).float().view(1,1,-1))
-        lm2=torch.log(mel2.squeeze(1).clamp(min=1e-5))  # (1,80,T)
-        z5=stu_v1(lm2).squeeze(0).T
-        zq,_=teacher.local_quantizer.fsq.encode(z5.unsqueeze(0))
-        ce_v1=teacher.local_quantizer.proj_out(zq)
-        w_v1=teacher.decode(global_embedding=fo.global_embedding,content_embedding=ce_v1.squeeze(0),target_audio_length=alen)
-    sf.write(f'{OUT}/{spk}_04_v1_hard.wav',w_v1.numpy()[:alen],SR)
-    print(f'{spk} v1 comparison done')
-
-print()
-print('Done! Files in ' + OUT + '/')
-print('  _01 = original | _02 = teacher VC | _03 = v2 student | _04 = v1 hard (for p255/256)')
+if __name__ == "__main__":
+    main()
