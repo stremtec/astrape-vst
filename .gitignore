@@ -8,6 +8,7 @@ __pycache__/
 *.mp3
 *.flac
 runs/
+logs/
 checkpoints/
 outputs/
 data/

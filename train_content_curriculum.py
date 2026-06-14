@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
         default=Path("checkpoints/teacher_fsq_proj_out.pt"),
     )
     parser.add_argument("--output-dir", type=Path, default=Path("checkpoints"))
+    parser.add_argument("--run-name", default="content_student_768x10_fsq")
     parser.add_argument("--device", default="mps")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--original-epochs", type=int, default=5)
@@ -30,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--attention-context-frames", type=int, default=100)
     parser.add_argument("--target-cosine", type=float, default=0.99)
+    parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--resume", type=Path)
@@ -56,6 +58,7 @@ def main() -> None:
             transcript_root=args.transcript_root,
             fsq_projection=args.fsq_projection,
             output_dir=args.output_dir,
+            run_name=args.run_name,
             device=args.device,
             batch_size=args.batch_size,
             original_epochs=args.original_epochs,
@@ -67,6 +70,7 @@ def main() -> None:
             num_workers=args.num_workers,
             resume=args.resume,
             target_cosine=args.target_cosine,
+            log_every=args.log_every,
         ),
     )
 

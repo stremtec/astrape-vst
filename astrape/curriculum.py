@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,6 +55,7 @@ class CurriculumConfig:
     num_workers: int = 0
     resume: Path | None = None
     target_cosine: float = 0.99
+    log_every: int = 50
 
     @property
     def epochs(self) -> int:
@@ -75,6 +77,8 @@ def validate_curriculum(config: CurriculumConfig) -> None:
         raise ValueError("Curriculum must contain at least one epoch")
     if config.steps_per_epoch <= 0 or config.batch_size <= 0:
         raise ValueError("steps_per_epoch and batch_size must be positive")
+    if config.log_every <= 0:
+        raise ValueError("log_every must be positive")
     if (
         config.max_teacher_mel_frames <= 0
         or config.max_teacher_mel_frames % 2
@@ -311,7 +315,8 @@ def train_curriculum(
         total_loss = 0.0
         teacher_steps = 0
         original_steps = 0
-        for _ in range(curriculum.steps_per_epoch):
+        epoch_started = time.perf_counter()
+        for step in range(1, curriculum.steps_per_epoch + 1):
             use_teacher = random.random() < teacher_probability
             if use_teacher:
                 raw_batch, teacher_iterator = _next(
@@ -331,6 +336,15 @@ def train_curriculum(
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             total_loss += loss.item()
+            if step % curriculum.log_every == 0 or step == curriculum.steps_per_epoch:
+                elapsed = time.perf_counter() - epoch_started
+                print(
+                    f"E{epoch:03d} {phase} step={step}/{curriculum.steps_per_epoch} "
+                    f"loss={total_loss / step:.4f} "
+                    f"teacher={teacher_steps} original={original_steps} "
+                    f"{elapsed / step:.3f}s/step",
+                    flush=True,
+                )
         scheduler.step()
         metrics = evaluate_teacher(model, teacher_validation, device)
         metrics.update(

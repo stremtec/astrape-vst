@@ -367,7 +367,7 @@ STREAMING SOURCE:
     → content_embedding (5-dim, projected to 768)
 
 OFFLINE TARGET (one-time):
-  target reference (1-3 seconds)
+  target reference (one continuous recording, >=5 seconds in production)
     → MioCodec Global Encoder (frozen)
     → global_embedding (128d) cached
 

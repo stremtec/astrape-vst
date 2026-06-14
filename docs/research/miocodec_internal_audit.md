@@ -138,7 +138,7 @@ Waveform quality TBD with vocoder path.
 
 | Component | Cacheable? | Why |
 |-----------|-----------|-----|
-| Target global embedding | **YES ★** | 128d vector, 1-3s reference audio, segment-stable (cos>0.99) |
+| Target global embedding | **YES ★** | 128d vector; 1-3s was experimentally stable, while production VoiceBank policy requires one continuous >=5s reference |
 | Target speaker identity | **YES** | Can pre-compute from voicebank |
 
 ### What NEEDS causal student

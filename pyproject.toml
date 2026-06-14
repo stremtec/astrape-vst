@@ -12,7 +12,11 @@ dependencies = [
   "scipy>=1.11",
   "soundfile>=0.12",
   "torch>=2.2",
+  "torchfcpe>=0.0.4",
   "torchaudio>=2.2",
+  "fastapi>=0.115",
+  "python-multipart>=0.0.20",
+  "uvicorn[standard]>=0.34",
 ]
 
 [tool.setuptools.packages.find]

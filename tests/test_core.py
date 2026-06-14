@@ -28,8 +28,22 @@ from astrape.fsq import (
     indices_to_level_indices,
 )
 from astrape.original_data import OriginalBatch, minimum_ctc_frames
+from astrape.streaming_pipeline import OutputRingBuffer, StreamingVoiceConverter
 from astrape.text import VOCAB_SIZE
+from astrape.voicebank import (
+    MIN_REFERENCE_SECONDS,
+    MIO_GLOBAL_MODEL,
+    VoiceBank,
+    analyze_reference,
+)
+from astrape.wave_decoder import (
+    DirectWaveDecoder,
+    WaveDecoderConfig,
+    load_wave_decoder,
+    save_wave_decoder_checkpoint,
+)
 from tiers import TIERS, get_tier
+from train_wave_decoder import WaveDataset
 
 
 class CoreTests(unittest.TestCase):
@@ -85,6 +99,15 @@ class CoreTests(unittest.TestCase):
             torch.cat(chunks, dim=-1), expected, atol=2e-6, rtol=2e-6
         )
 
+    def test_content_streaming_emits_first_frame_without_pair_buffer(self):
+        model = self.small_student()
+        output, state = model.forward_stream(torch.randn(1, 80, 1))
+        self.assertEqual(output.content.shape[-1], 1)
+        output, state = model.forward_stream(torch.randn(1, 80, 1), state)
+        self.assertEqual(output.content.shape[-1], 0)
+        output, _ = model.forward_stream(torch.randn(1, 80, 1), state)
+        self.assertEqual(output.content.shape[-1], 1)
+
     def test_limited_attention_streaming_matches_full_sequence(self):
         model = ContentStudent(
             ContentStudentConfig(
@@ -123,6 +146,247 @@ class CoreTests(unittest.TestCase):
         torch.testing.assert_close(
             torch.cat(chunks, dim=-1), expected, atol=2e-6, rtol=2e-6
         )
+
+    def small_wave_decoder(self) -> DirectWaveDecoder:
+        return DirectWaveDecoder(
+            WaveDecoderConfig(
+                content_dim=8,
+                condition_dim=4,
+                sample_rate=600,
+                content_rate=100,
+                initial_channels=16,
+                stage_channels=(12, 8),
+                upsample_factors=(2, 3),
+                mrf_kernel_sizes=(3,),
+                mrf_dilations=((1, 2),),
+                output_kernel_size=3,
+            )
+        ).eval()
+
+    def test_wave_decoder_output_length_and_no_future_leakage(self):
+        decoder = self.small_wave_decoder()
+        prefix = torch.randn(1, 3, 8)
+        suffix = torch.randn(1, 2, 8)
+        global_embedding = torch.randn(1, 4)
+        prefix_audio = decoder(prefix, global_embedding)
+        full_audio = decoder(
+            torch.cat((prefix, suffix), dim=1),
+            global_embedding,
+        )
+        self.assertEqual(prefix_audio.shape[-1], 3 * 6)
+        torch.testing.assert_close(
+            prefix_audio,
+            full_audio[:, : prefix_audio.shape[-1]],
+            atol=2e-6,
+            rtol=2e-6,
+        )
+
+    def test_wave_decoder_streaming_matches_irregular_chunks(self):
+        decoder = self.small_wave_decoder()
+        content = torch.randn(1, 7, 8)
+        global_embedding = torch.randn(1, 4)
+        expected = decoder(content, global_embedding)
+        state = None
+        chunks = []
+        for start, length in ((0, 1), (1, 3), (4, 2), (6, 1)):
+            output, state = decoder.forward_stream(
+                content[:, start : start + length],
+                global_embedding,
+                state,
+            )
+            chunks.append(output)
+        actual = torch.cat(chunks, dim=-1)
+        self.assertEqual(state.content_frames, content.shape[1])
+        torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+
+    def test_wave_decoder_checkpoint_roundtrip(self):
+        decoder = self.small_wave_decoder()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "wave.pt"
+            save_wave_decoder_checkpoint(
+                path,
+                decoder,
+                step=12,
+                metrics={"loss": 0.5},
+            )
+            loaded = load_wave_decoder(path)
+            self.assertEqual(loaded.config, decoder.config)
+            content = torch.randn(1, 2, 8)
+            condition = torch.randn(1, 4)
+            torch.testing.assert_close(
+                loaded(content, condition),
+                decoder(content, condition),
+            )
+
+    def test_voicebank_requires_one_reference_of_at_least_five_seconds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "voicebank.npz"
+            bank = VoiceBank(
+                global_embedding=torch.randn(128),
+                duration_seconds=MIN_REFERENCE_SECONDS,
+                source_sample_rate=44100,
+                source_path="/tmp/reference.wav",
+            )
+            bank.save(path)
+            loaded = VoiceBank.load(path)
+            torch.testing.assert_close(
+                loaded.global_embedding,
+                bank.global_embedding,
+            )
+            self.assertEqual(loaded.duration_seconds, MIN_REFERENCE_SECONDS)
+            with self.assertRaises(ValueError):
+                VoiceBank(
+                    global_embedding=torch.randn(128),
+                    duration_seconds=MIN_REFERENCE_SECONDS - 0.01,
+                    source_sample_rate=44100,
+                    source_path="/tmp/short.wav",
+                ).validate()
+
+    def test_voicebank_v2_metadata_and_v1_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            versioned = directory / "v2.npz"
+            legacy = directory / "v1.npz"
+            bank = VoiceBank(
+                global_embedding=torch.randn(128),
+                duration_seconds=6.0,
+                source_sample_rate=44100,
+                source_path="/tmp/reference.wav",
+                reference_sha256="abc",
+                created_utc="2026-06-14T00:00:00+00:00",
+                peak_amplitude=0.8,
+                rms_dbfs=-20.0,
+                clipping_fraction=0.0,
+                active_speech_ratio=0.9,
+                dc_offset=0.001,
+                quality_warnings=("test_warning",),
+            )
+            bank.save(versioned)
+            loaded = VoiceBank.load(versioned)
+            self.assertEqual(loaded.reference_sha256, "abc")
+            self.assertEqual(loaded.quality_warnings, ("test_warning",))
+            np.savez_compressed(
+                legacy,
+                format_version=np.asarray(1, dtype=np.int64),
+                global_embedding=bank.global_embedding.numpy(),
+                duration_seconds=np.asarray(6.0, dtype=np.float32),
+                source_sample_rate=np.asarray(44100, dtype=np.int64),
+                source_path=np.asarray("/tmp/legacy.wav"),
+            )
+            migrated = VoiceBank.load(legacy)
+            self.assertEqual(migrated.embedding_model, MIO_GLOBAL_MODEL)
+            self.assertTrue(np.isnan(migrated.rms_dbfs))
+
+    def test_reference_quality_detects_clipping_and_low_activity(self):
+        audio = np.zeros(16000 * 6, dtype=np.float32)
+        audio[:12] = 1.0
+        quality = analyze_reference(audio, 16000)
+        self.assertIn("clipping_detected", quality.warnings)
+        self.assertIn("reference_too_quiet", quality.warnings)
+        self.assertIn("low_active_speech_ratio", quality.warnings)
+
+    def test_e2e_streaming_pipeline_matches_full_models(self):
+        content_model = ContentStudent(
+            ContentStudentConfig(
+                hidden=32,
+                n_layers=2,
+                n_heads=4,
+                content_dim=8,
+            )
+        ).eval()
+        wave_model = DirectWaveDecoder(
+            WaveDecoderConfig(
+                content_dim=8,
+                condition_dim=4,
+                sample_rate=150,
+                content_rate=25,
+                initial_channels=16,
+                stage_channels=(12, 8),
+                upsample_factors=(2, 3),
+                mrf_kernel_sizes=(3,),
+                mrf_dilations=((1, 2),),
+                output_kernel_size=3,
+            )
+        ).eval()
+        condition = torch.randn(4)
+        frontend = StreamingLogMel()
+        waveform = torch.randn(6031)
+        expected_mel = frontend(waveform)
+        expected_content = content_model(expected_mel).content
+        expected = wave_model(
+            expected_content.transpose(1, 2),
+            condition.unsqueeze(0),
+        )
+        pipeline = StreamingVoiceConverter(
+            content_model,
+            wave_model,
+            condition,
+        )
+        output_chunks = []
+        start = 0
+        chunk_sizes = (157, 641, 83, 1000, 319)
+        chunk_index = 0
+        while start < waveform.numel():
+            size = chunk_sizes[chunk_index % len(chunk_sizes)]
+            chunk = pipeline.process(waveform[start : start + size])
+            if chunk.output_samples:
+                output_chunks.append(chunk.audio)
+            start += size
+            chunk_index += 1
+        final = pipeline.flush()
+        if final.output_samples:
+            output_chunks.append(final.audio)
+        actual = torch.cat(output_chunks, dim=-1)
+        torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+        self.assertEqual(
+            pipeline.counters.output_samples,
+            expected.shape[-1],
+        )
+        with self.assertRaises(RuntimeError):
+            pipeline.process(torch.zeros(1))
+
+    def test_output_ring_buffer_tracks_underruns(self):
+        buffer = OutputRingBuffer(capacity_samples=4)
+        buffer.write(torch.tensor([1.0, 2.0, 3.0]))
+        torch.testing.assert_close(
+            buffer.read(2),
+            torch.tensor([1.0, 2.0]),
+        )
+        torch.testing.assert_close(
+            buffer.read(3),
+            torch.tensor([3.0, 0.0, 0.0]),
+        )
+        self.assertEqual(buffer.buffered_samples, 0)
+        self.assertEqual(buffer.underrun_samples, 2)
+        buffer.write(torch.tensor([1.0, 2.0, 3.0]))
+        buffer.write(torch.tensor([4.0, 5.0, 6.0]))
+        torch.testing.assert_close(
+            buffer.read(4),
+            torch.tensor([3.0, 4.0, 5.0, 6.0]),
+        )
+        self.assertEqual(buffer.overrun_samples, 2)
+
+    def test_wave_validation_crop_is_stable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            np.savez(
+                data_dir / "s_00000.npz",
+                ce_768=np.arange(12 * 768, dtype=np.float32).reshape(12, 768),
+                ge_128=np.zeros(128, dtype=np.float32),
+                audio=np.arange(12 * 1764, dtype=np.float32),
+            )
+            dataset = WaveDataset(
+                data_dir,
+                np.asarray([0]),
+                crop_frames=4,
+                target_dir=None,
+                seed=123,
+                random_crops=False,
+            )
+            first = dataset[0]
+            second = dataset[0]
+            torch.testing.assert_close(first.content, second.content)
+            torch.testing.assert_close(first.waveform, second.waveform)
 
     def test_streaming_logmel_matches_full_sequence(self):
         extractor = StreamingLogMel()

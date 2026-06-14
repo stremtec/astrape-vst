@@ -46,8 +46,9 @@
 ```
 Pipeline:
   Source Audio → Mel Spectrogram → [Content Student] → Content (768d @ 25Hz)
-  Target Audio → MioCodec Encode → Global Embedding (128d)
-  Content + Global → [Causal Mel Decoder] → Mel → [Wave Decoder] → Waveform
+  Target Audio (one continuous recording, >=5s) → MioCodec Encode
+    → VoiceBank Global Embedding (128d)
+  Content + Global → [Direct Causal Wave Decoder] → Waveform (44.1kHz)
 ```
 
 ---
@@ -74,14 +75,22 @@ Pipeline:
 | Causality | Causal self-attention (no future leakage) |
 | Status | ✅ Trained, verified (target > source > other > zero) |
 
-### 2.3 Wave Decoder (Teacher, non-causal)
+### 2.3 Direct Wave Decoder
 
 | Component | Detail |
 |-----------|--------|
-| Current | MioCodec teacher wave decoder (ISTFT + non-causal Transformer) |
-| Issue | ❌ Non-causal — blocks streaming |
-| Plan | Causalize teacher decoder (causal=True flag + streaming ISTFT buffer) |
-| Backup | Streaming HiFi-GAN if teacher causalization fails |
+| Input | Content embedding (768d @ 25Hz) + VoiceBank embedding (128d) |
+| Architecture | Causal upsampling generator with cached convolutions |
+| Output | Exactly 1,764 samples per content frame at 44.1kHz |
+| Status | Implemented and streaming-verified; production checkpoint not trained |
+
+### 2.4 VoiceBank Contract
+
+- One continuous target-speaker recording of at least five seconds.
+- Longer input such as 10 seconds, 30 seconds, or one minute is user choice.
+- Multiple references are not required.
+- No target-specific training or fine-tuning occurs, so the interface remains
+  zero-shot.
 
 ---
 

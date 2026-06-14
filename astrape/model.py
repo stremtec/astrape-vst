@@ -63,7 +63,11 @@ class CausalConv1d(nn.Conv1d):
         return super().forward(x)
 
     def forward_stream(
-        self, x: torch.Tensor, cache: Optional[torch.Tensor]
+        self,
+        x: torch.Tensor,
+        cache: Optional[torch.Tensor],
+        *,
+        position: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         context = self.left_context
         if cache is None:
@@ -71,7 +75,23 @@ class CausalConv1d(nn.Conv1d):
         if cache.shape[:2] != x.shape[:2] or cache.shape[2] != context:
             raise ValueError("Invalid convolution streaming cache shape")
         joined = torch.cat((cache, x), dim=-1)
-        out = super().forward(joined)
+        if self.stride[0] == 1:
+            out = super().forward(joined)
+        else:
+            all_outputs = F.conv1d(
+                joined,
+                self.weight,
+                self.bias,
+                stride=1,
+                dilation=self.dilation,
+                groups=self.groups,
+            )
+            global_positions = position + torch.arange(
+                x.shape[-1], device=x.device
+            )
+            out = all_outputs[
+                :, :, global_positions.remainder(self.stride[0]) == 0
+            ]
         next_cache = joined[:, :, -context:] if context else joined[:, :, :0]
         return out, next_cache
 
@@ -104,12 +124,12 @@ class SafeCausalConv1d(nn.Module):
     def left_context(self) -> int:
         return self.dilation * (self.kernel_size - 1)
 
-    def _convolve(self, x: torch.Tensor) -> torch.Tensor:
+    def _convolve(self, x: torch.Tensor, stride: Optional[int] = None) -> torch.Tensor:
         unfolded = F.unfold(
             x.unsqueeze(-1),
             kernel_size=(self.kernel_size, 1),
             dilation=(self.dilation, 1),
-            stride=(self.stride, 1),
+            stride=(self.stride if stride is None else stride, 1),
         )
         unfolded = unfolded.transpose(1, 2)
         out = torch.matmul(unfolded, self.weight.reshape(self.out_channels, -1).T)
@@ -123,7 +143,11 @@ class SafeCausalConv1d(nn.Module):
         return self._convolve(x)
 
     def forward_stream(
-        self, x: torch.Tensor, cache: Optional[torch.Tensor]
+        self,
+        x: torch.Tensor,
+        cache: Optional[torch.Tensor],
+        *,
+        position: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         context = self.left_context
         if cache is None:
@@ -131,7 +155,16 @@ class SafeCausalConv1d(nn.Module):
         if cache.shape[:2] != x.shape[:2] or cache.shape[2] != context:
             raise ValueError("Invalid convolution streaming cache shape")
         joined = torch.cat((cache, x), dim=-1)
-        out = self._convolve(joined)
+        if self.stride == 1:
+            out = self._convolve(joined)
+        else:
+            all_outputs = self._convolve(joined, stride=1)
+            global_positions = position + torch.arange(
+                x.shape[-1], device=x.device
+            )
+            out = all_outputs[
+                :, :, global_positions.remainder(self.stride) == 0
+            ]
         next_cache = joined[:, :, -context:] if context else joined[:, :, :0]
         return out, next_cache
 
@@ -391,7 +424,16 @@ class ContentStudent(nn.Module):
             if x.shape[0] != state.pending_mel.shape[0]:
                 raise ValueError("Streaming batch size changed")
             x = torch.cat((state.pending_mel, x), dim=-1)
-        process_length = x.shape[-1] if flush else x.shape[-1] - x.shape[-1] % 2
+        if flush:
+            process_length = x.shape[-1]
+        elif state.position == 0:
+            process_length = (
+                x.shape[-1]
+                if x.shape[-1] % 2
+                else max(0, x.shape[-1] - 1)
+            )
+        else:
+            process_length = x.shape[-1] - x.shape[-1] % 2
         state.pending_mel = x[:, :, process_length:]
         x = x[:, :, :process_length]
         if x.shape[-1] == 0:
@@ -416,8 +458,16 @@ class ContentStudent(nn.Module):
             )
         h = self.norm(h)
         h, state.down_cache = self.down.forward_stream(
-            h.transpose(1, 2), state.down_cache
+            h.transpose(1, 2),
+            state.down_cache,
+            position=state.position,
         )
+        state.position += x.shape[-1]
+        if h.shape[-1] == 0:
+            if flush:
+                state.pending_mel = None
+            empty = x.new_empty(x.shape[0], self.config.content_dim, 0)
+            return ContentStudentOutput(content=empty), state
         hard_content = None
         fsq_logits = None
         fsq_codes = None
@@ -426,7 +476,6 @@ class ContentStudent(nn.Module):
             content = hard_content
         else:
             content = self.content_head(h)
-        state.position += x.shape[-1]
         if flush:
             state.pending_mel = None
         return (
