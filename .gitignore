@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+*.egg-info/
+.webui/
 *.pt
 *.pth
 *.ckpt

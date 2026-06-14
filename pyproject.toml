@@ -20,4 +20,10 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["astrape*"]
+include = ["astrape*", "webui*"]
+
+[tool.setuptools.package-data]
+webui = ["static/*"]
+
+[project.scripts]
+astrape-webui = "webui.server:main"

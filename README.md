@@ -3,6 +3,17 @@
 Research code for a causal, zero-shot voice-conversion pipeline distilled from
 MioCodec.
 
+## WebUI
+
+```bash
+.venv/bin/python -m webui.server
+```
+
+Open `http://127.0.0.1:8765`. The local VC console provides VoiceBank upload,
+profile diagnostics, FCPE F0 analysis, browser audio-device routing,
+pitch/formant capability controls, training status, and a WebSocket streaming
+path that activates when a production direct-wave checkpoint is available.
+
 ## Current Pipeline
 
 ```text

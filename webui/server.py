@@ -5,7 +5,6 @@ import importlib.util
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -33,7 +32,7 @@ from pydantic import BaseModel, Field
 
 from astrape.streaming_pipeline import StreamingVoiceConverter
 from astrape.voicebank import VoiceBank
-from astrape.wave_decoder import load_wave_decoder
+from astrape.wave_decoder import WaveDecoderConfig
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -129,17 +128,33 @@ def _training_status() -> dict[str, Any]:
     log_path = Path(latest.read_text().strip())
     lines = log_path.read_text(errors="replace").splitlines() if log_path.exists() else []
     line = lines[-1] if lines else "Waiting for first log line"
-    match = re.search(
-        r"E(\d+) (\w+)(?: step=(\d+)/(\d+))?.*?(?:frame_cos=([0-9.-]+))?",
-        line,
-    )
+    match = re.search(r"E(\d+) (\w+)(?: step=(\d+)/(\d+))?", line)
+    pid = None
     pid_path = ROOT / "logs" / "content_curriculum.pid"
-    pid = int(pid_path.read_text()) if pid_path.exists() else None
+    candidates = []
+    if pid_path.exists():
+        candidates.append(int(pid_path.read_text()))
+    try:
+        process_search = subprocess.run(
+            ["pgrep", "-f", "train_content_curriculum.py"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        candidates.extend(
+            int(value)
+            for value in process_search.stdout.split()
+            if value.isdigit()
+        )
+    except OSError:
+        pass
     running = False
-    if pid is not None:
+    for candidate in sorted(set(candidates), reverse=True):
         try:
-            os.kill(pid, 0)
+            os.kill(candidate, 0)
+            pid = candidate
             running = True
+            break
         except OSError:
             pass
     result: dict[str, Any] = {
@@ -155,11 +170,10 @@ def _training_status() -> dict[str, Any]:
                 "phase": match.group(2),
                 "step": int(match.group(3)) if match.group(3) else None,
                 "steps": int(match.group(4)) if match.group(4) else None,
-                "frame_cosine": (
-                    float(match.group(5)) if match.group(5) else None
-                ),
             }
         )
+    cosine = re.search(r"frame_cos=([0-9.-]+)", line)
+    result["frame_cosine"] = float(cosine.group(1)) if cosine else None
     return result
 
 
@@ -218,8 +232,10 @@ def _decoder_capabilities() -> dict[str, Any]:
             "f0_model": "",
         }
     try:
-        model = load_wave_decoder(checkpoint)
-        config = model.config
+        payload = torch.load(checkpoint, map_location="cpu")
+        if payload.get("model_type") != "direct_wave_decoder":
+            raise ValueError("Invalid direct waveform checkpoint")
+        config = WaveDecoderConfig(**payload["config"])
         return {
             "ready": True,
             "checkpoint": str(checkpoint),
@@ -229,7 +245,10 @@ def _decoder_capabilities() -> dict[str, Any]:
             "f0_model": config.f0_model,
             "sample_rate": config.sample_rate,
             "content_rate": config.content_rate,
-            "parameters": sum(parameter.numel() for parameter in model.parameters()),
+            "parameters": sum(
+                tensor.numel()
+                for tensor in payload["state_dict"].values()
+            ),
         }
     except Exception as error:
         return {
@@ -474,7 +493,7 @@ def delete_voicebank(profile_id: str) -> dict[str, bool]:
     source = Path(bank.source_path)
     path.unlink()
     try:
-        source.relative_to(MEDIA_DIR).is_relative_to(Path("."))
+        source.resolve().relative_to(MEDIA_DIR.resolve())
         source.unlink(missing_ok=True)
     except ValueError:
         pass
@@ -521,16 +540,17 @@ async def stream(websocket: WebSocket) -> None:
             )
             await websocket.close(code=1013)
             return
-        wave_model = load_wave_decoder(wave_checkpoint)
+        payload = torch.load(wave_checkpoint, map_location="cpu")
+        wave_config = WaveDecoderConfig(**payload["config"])
         pitch = float(configuration.get("pitch_semitones", 0.0))
         formant = float(configuration.get("formant_semitones", 0.0))
-        if pitch and not wave_model.config.supports_f0_conditioning:
+        if pitch and not wave_config.supports_f0_conditioning:
             await websocket.send_json(
                 {"type": "error", "message": "This checkpoint has no F0 conditioning"}
             )
             await websocket.close(code=1008)
             return
-        if formant and not wave_model.config.supports_formant_conditioning:
+        if formant and not wave_config.supports_formant_conditioning:
             await websocket.send_json(
                 {
                     "type": "error",
