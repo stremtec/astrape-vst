@@ -90,7 +90,15 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _coerce_path(path):
+    raw = str(path)
+    if raw.startswith("np.str_(") and raw.endswith(")"):
+        return raw[len("np.str_("):-1]
+    return raw
+
+
 def load_audio(path: str, max_seconds: float) -> torch.Tensor:
+    path = _coerce_path(path)
     audio, sample_rate = sf.read(path, always_2d=False, dtype="float32")
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
