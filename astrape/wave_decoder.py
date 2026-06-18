@@ -42,8 +42,13 @@ class CausalConv1d(nn.Conv1d):
         return out, next_cache
 
 
+# Legacy direct-wave decoder config/state -----------------------------------------
+
+
 @dataclass(frozen=True)
 class WaveDecoderConfig:
+    """Legacy config for DirectWaveDecoder checkpoint compatibility."""
+
     content_dim: int = 768
     condition_dim: int = 128
     sample_rate: int = 44100
@@ -133,6 +138,8 @@ class UpsampleStageState:
 
 @dataclass
 class WaveDecoderState:
+    """Legacy streaming state for DirectWaveDecoder checkpoint compatibility."""
+
     stages: list[UpsampleStageState]
     output_cache: Optional[torch.Tensor] = None
     content_frames: int = 0
@@ -387,7 +394,12 @@ class CausalUpsampleStage(nn.Module):
 
 
 class DirectWaveDecoder(nn.Module):
-    """Strict-causal 25 Hz content and VoiceBank global to 44.1 kHz PCM."""
+    """Legacy direct 25 Hz content + VoiceBank global to 44.1 kHz PCM.
+
+    The current synthesis path lives in astrape.decoder.CausalSynthesisDecoder.
+    This class remains loadable so old direct-wave checkpoints can be inspected
+    or migrated.
+    """
 
     def __init__(self, config: WaveDecoderConfig = WaveDecoderConfig()):
         super().__init__()

@@ -135,6 +135,25 @@ class EncoderStreamingTests(unittest.TestCase):
 
         self.assertEqual(out.content.shape[-1], old_table_len + 3)
 
+    def test_full_forward_pads_odd_mel_like_streaming_flush(self):
+        config = tiny_encoder_config()
+        model = CausalContentEncoder(config)
+        model.eval()
+        mel = torch.randn(1, config.mel_dim, 5)
+
+        with torch.no_grad():
+            full = model(mel)
+
+        state = None
+        streamed, state = model.forward_stream(mel, state)
+        flushed, _ = model.forward_stream(
+            torch.empty(1, config.mel_dim, 0), state, flush=True
+        )
+        combined = torch.cat((streamed.content, flushed.content), dim=-1)
+
+        self.assertEqual(full.content.shape[-1], 3)
+        torch.testing.assert_close(full.content, combined, atol=1e-5, rtol=1e-5)
+
 
 class DecoderStreamingTests(unittest.TestCase):
     def setUp(self):
@@ -217,6 +236,19 @@ class DecoderStreamingTests(unittest.TestCase):
     def test_config_rejects_resnet_block_dilation_mismatch(self):
         with self.assertRaisesRegex(ValueError, "resnet_blocks"):
             SynthesisDecoderConfig(resnet_blocks=2, resnet_dilations=(1,))
+
+    def test_config_rejects_invalid_dropout(self):
+        with self.assertRaisesRegex(ValueError, "dropout"):
+            SynthesisDecoderConfig(dropout=1.0)
+
+    def test_decoder_dropout_is_wired_to_transformer_layers(self):
+        config = tiny_decoder_config()
+        config = SynthesisDecoderConfig(
+            **{**config.__dict__, "dropout": 0.25}
+        )
+        model = CausalSynthesisDecoder(config)
+        self.assertEqual(model.transformer.layers[0].attn_drop.p, 0.25)
+        self.assertEqual(model.transformer.layers[0].ffn_drop.p, 0.25)
 
 
 class PipelineTests(unittest.TestCase):

@@ -29,12 +29,8 @@ from .encoder import RoPE
 from .voicebank import MIO_GLOBAL_MODEL
 from .wave_decoder import (
     CausalConv1d,
-    CausalMRF,
-    CausalResidualBranch,
     CausalUpsampleStage,
     ChannelLayerNorm,
-    FiLM,
-    MRFState,
     Snake1d,
     UpsampleStageState,
 )
@@ -56,6 +52,7 @@ class SynthesisDecoderConfig:
     transformer_layers: int = 4
     transformer_ff_mult: int = 3
     transformer_window: int = 32
+    dropout: float = 0.0
     rope_theta: float = 10000.0
     # ResNet refinement
     resnet_blocks: int = 2
@@ -91,6 +88,8 @@ class SynthesisDecoderConfig:
             raise ValueError("transformer head dimension must be even for RoPE")
         if self.transformer_window <= 0:
             raise ValueError("transformer_window must be positive")
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1)")
         if self.resnet_blocks < 0:
             raise ValueError("resnet_blocks must be non-negative")
         if len(self.resnet_dilations) != self.resnet_blocks:
@@ -158,22 +157,30 @@ class AdaLNZero(nn.Module):
 
 
 class AdaLNTransformerLayer(nn.Module):
-    def __init__(self, dim: int, heads: int, condition_dim: int, ff_mult: int = 3, dropout: float = 0.0):
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        condition_dim: int,
+        ff_mult: int = 3,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         self.heads = heads
         self.head_dim = dim // heads
-        self.scale = self.head_dim ** -0.5
 
         self.attn_adaln = AdaLNZero(dim, condition_dim)
         self.wq = nn.Linear(dim, dim, bias=False)
         self.wk = nn.Linear(dim, dim, bias=False)
         self.wv = nn.Linear(dim, dim, bias=False)
         self.wo = nn.Linear(dim, dim, bias=False)
+        self.attn_drop = nn.Dropout(dropout)
 
         self.ffn_adaln = AdaLNZero(dim, condition_dim)
         self.w1 = nn.Linear(dim, dim * ff_mult, bias=False)
         self.w3 = nn.Linear(dim, dim * ff_mult, bias=False)
         self.w2 = nn.Linear(dim * ff_mult, dim, bias=False)
+        self.ffn_drop = nn.Dropout(dropout)
 
     def forward(
         self,
@@ -203,13 +210,15 @@ class AdaLNTransformerLayer(nn.Module):
         mask = torch.triu(mask, diagonal=-(window - 1))
         mask = mask.unsqueeze(0).unsqueeze(0)
 
-        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        attn = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, dropout_p=self.attn_drop.p if self.training else 0.0
+        )
         attn = attn.transpose(1, 2).contiguous().view(B, T, D)
         x = x + gate_a * self.wo(attn)
 
         # FFN with AdaLN-Zero
         normed, gate_f = self.ffn_adaln(x, condition)
-        x = x + gate_f * self.w2(F.silu(self.w1(normed)) * self.w3(normed))
+        x = x + gate_f * self.ffn_drop(self.w2(F.silu(self.w1(normed)) * self.w3(normed)))
         return x
 
     def forward_stream(
@@ -246,8 +255,7 @@ class AdaLNTransformerLayer(nn.Module):
             v_all = v_cache[:, :valid_len]
         else:
             start = new_cache_len % max_len
-            indices = [(start + i) % max_len for i in range(max_len)]
-            idx = torch.tensor(indices, device=k_cache.device)
+            idx = (torch.arange(max_len, device=k_cache.device) + start) % max_len
             k_all = k_cache[:, idx]
             v_all = v_cache[:, idx]
 
@@ -283,6 +291,7 @@ class SynthesisTransformer(nn.Module):
             AdaLNTransformerLayer(
                 dim, config.transformer_heads, config.condition_dim,
                 config.transformer_ff_mult,
+                config.dropout,
             )
             for _ in range(config.transformer_layers)
         ])

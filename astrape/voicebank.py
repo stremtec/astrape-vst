@@ -219,23 +219,6 @@ class VoiceBank:
             if not np.isnan(value) and not 0.0 <= value <= 1.0:
                 raise ValueError(f"VoiceBank {name} must be in [0, 1]")
 
-    @staticmethod
-    def _metadata_dict(self) -> dict[str, Any]:
-        return {
-            "duration_seconds": self.duration_seconds,
-            "source_sample_rate": self.source_sample_rate,
-            "source_path": self.source_path,
-            "embedding_model": self.embedding_model,
-            "reference_sha256": self.reference_sha256,
-            "created_utc": self.created_utc,
-            "peak_amplitude": _encode_nan(self.peak_amplitude),
-            "rms_dbfs": _encode_nan(self.rms_dbfs),
-            "clipping_fraction": _encode_nan(self.clipping_fraction),
-            "active_speech_ratio": _encode_nan(self.active_speech_ratio),
-            "dc_offset": _encode_nan(self.dc_offset),
-            "quality_warnings": list(self.quality_warnings),
-        }
-
     def save(
         self,
         path: str | Path,

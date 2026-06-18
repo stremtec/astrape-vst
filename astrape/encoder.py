@@ -160,7 +160,6 @@ class CausalTransformerLayer(nn.Module):
         super().__init__()
         self.heads = heads
         self.head_dim = dim // heads
-        self.scale = self.head_dim ** -0.5
 
         self.attn_norm = nn.LayerNorm(dim)
         self.wq = nn.Linear(dim, dim, bias=False)
@@ -244,8 +243,7 @@ class CausalTransformerLayer(nn.Module):
             v_all = v_cache[:, :valid_len]
         else:
             start = new_cache_len % max_len
-            indices = [(start + i) % max_len for i in range(max_len)]
-            idx = torch.tensor(indices, device=k_cache.device)
+            idx = (torch.arange(max_len, device=k_cache.device) + start) % max_len
             k_all = k_cache[:, idx]
             v_all = v_cache[:, idx]
 
@@ -394,36 +392,6 @@ class FSQBottleneck(nn.Module):
         self.proj_out.bias.data.copy_(weights["bias"])
 
 
-# --- Speaker Adversarial ---
-
-
-class GradientReversal(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, scale):
-        ctx.scale = scale
-        return x.clone()
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return -ctx.scale * grad_output, None
-
-
-class SpeakerAdversarial(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, n_speakers: int):
-        super().__init__()
-        self.classifier = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, n_speakers),
-        )
-
-    def forward(
-        self, x: torch.Tensor, scale: float = 0.1
-    ) -> torch.Tensor:
-        x = GradientReversal.apply(x, scale)
-        return self.classifier(x)
-
-
 # --- Main Encoder ---
 
 
@@ -461,9 +429,9 @@ class CausalContentEncoder(nn.Module):
 
         # Downsample: pair adjacent frames
         x = x.transpose(1, 2)  # (B, T, D)
-        T_trunc = (x.shape[1] // 2) * 2
-        x = x[:, :T_trunc]
-        x = x.reshape(B, T_trunc // 2, self.config.frontend_dim * 2)
+        if x.shape[1] % 2:
+            x = torch.cat((x, torch.zeros_like(x[:, :1])), dim=1)
+        x = x.reshape(B, x.shape[1] // 2, self.config.frontend_dim * 2)
         x = self.downsample_proj(x)
 
         # Transformer

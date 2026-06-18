@@ -199,7 +199,8 @@ class DecoderPretrainDataset(Dataset):
                 "speaker": spk_name,
                 "speaker_embedding": spk_emb,
             }
-        except (FileNotFoundError, Exception) as e:
+        except FileNotFoundError as e:
+            log.warning("Skipping sample %s: %s", index, e)
             return None
 
 

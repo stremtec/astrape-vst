@@ -11,6 +11,7 @@ import extract_wavlm_targets
 from astrape.data import masked_content_loss
 from astrape.voicebank import MIO_GLOBAL_MODEL, VoiceBank
 from train_decoder_phase0 import (
+    DecoderPretrainDataset,
     collate_skip_none,
     load_voicebank_dir,
     validate_voicebank_coverage,
@@ -66,6 +67,46 @@ class Phase0VoicebankHelperTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(ValueError, "partial speaker embedding"):
             collate_skip_none(batch)
+
+    def test_phase0_dataset_does_not_swallow_corrupt_sample_cache(self):
+        with tempfile.TemporaryDirectory() as d:
+            data_dir = Path(d)
+            np.savez(
+                data_dir / "meta.npz",
+                n_samples=1,
+                source_files=np.asarray(["missing.wav"]),
+                spk_names=np.asarray(["p225"]),
+            )
+            (data_dir / "s_00000.npz").write_bytes(b"not an npz")
+
+            dataset = DecoderPretrainDataset(
+                data_dir,
+                data_dir,
+                speaker_embeddings={},
+            )
+            with self.assertRaises(Exception):
+                _ = dataset[0]
+
+    def test_phase0_dataset_skips_missing_audio(self):
+        with tempfile.TemporaryDirectory() as d:
+            data_dir = Path(d)
+            np.savez(
+                data_dir / "meta.npz",
+                n_samples=1,
+                source_files=np.asarray(["missing.wav"]),
+                spk_names=np.asarray(["p225"]),
+            )
+            np.savez(
+                data_dir / "s_00000.npz",
+                ce_768=np.zeros((2, 768), dtype=np.float32),
+            )
+
+            dataset = DecoderPretrainDataset(
+                data_dir,
+                data_dir,
+                speaker_embeddings={},
+            )
+            self.assertIsNone(dataset[0])
 
 
 class EncoderSSLHelperTests(unittest.TestCase):
