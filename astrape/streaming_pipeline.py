@@ -9,14 +9,9 @@ from typing import Optional
 import torch
 
 from .audio import LogMelState, StreamingLogMel
-from .checkpoint import load_content_checkpoint
-from .model import ContentStudent, StreamingState
+from .decoder import CausalSynthesisDecoder, SynthesisDecoderState
+from .encoder import CausalContentEncoder, ContentEncoderState
 from .voicebank import VoiceBank
-from .wave_decoder import (
-    DirectWaveDecoder,
-    WaveDecoderState,
-    load_wave_decoder,
-)
 
 
 @dataclass
@@ -41,7 +36,7 @@ class StreamChunk:
 
 
 class OutputRingBuffer:
-    """CPU waveform buffer bridging 40 ms model blocks to audio callbacks."""
+    """CPU waveform buffer bridging model blocks to audio callbacks."""
 
     def __init__(self, capacity_samples: int = 44100):
         if capacity_samples <= 0:
@@ -81,7 +76,7 @@ class OutputRingBuffer:
                 self._chunks.clear()
                 self._offset = 0
                 self.buffered_samples = 0
-                audio = audio[-self.capacity_samples :]
+                audio = audio[-self.capacity_samples:]
                 self.overrun_samples += dropped
             elif self.buffered_samples + audio.numel() > self.capacity_samples:
                 dropped = (
@@ -104,8 +99,8 @@ class OutputRingBuffer:
                 chunk = self._chunks[0]
                 available = chunk.numel() - self._offset
                 take = min(sample_count - written, available)
-                output[written : written + take] = chunk[
-                    self._offset : self._offset + take
+                output[written: written + take] = chunk[
+                    self._offset: self._offset + take
                 ]
                 written += take
                 self._offset += take
@@ -118,78 +113,50 @@ class OutputRingBuffer:
 
 
 class StreamingVoiceConverter:
-    """Stateful 16 kHz PCM to 44.1 kHz zero-shot voice conversion."""
+    """Stateful 16kHz PCM to 44.1kHz zero-shot voice conversion."""
 
     def __init__(
         self,
-        content_model: ContentStudent,
-        wave_model: DirectWaveDecoder,
+        encoder: CausalContentEncoder,
+        decoder: CausalSynthesisDecoder,
         global_embedding: torch.Tensor,
         *,
         frontend: Optional[StreamingLogMel] = None,
-        frontend_device: torch.device | str = "cpu",
         return_cpu: bool = True,
     ):
-        self.content_model = content_model.eval()
-        self.wave_model = wave_model.eval()
+        self.encoder = encoder.eval()
+        self.decoder = decoder.eval()
         self.frontend = frontend or StreamingLogMel()
-        self.frontend_device = torch.device(frontend_device)
         self.return_cpu = return_cpu
-        self.device = next(content_model.parameters()).device
-        wave_device = next(wave_model.parameters()).device
-        if wave_device != self.device:
-            raise ValueError("Content and waveform models must use the same device")
-        if self.frontend.n_mels != content_model.config.in_dim:
-            raise ValueError("Frontend mel dimension does not match content model")
-        if content_model.config.content_dim != wave_model.config.content_dim:
-            raise ValueError("Content and waveform feature dimensions do not match")
+        self.device = next(encoder.parameters()).device
+        decoder_device = next(decoder.parameters()).device
+        if decoder_device != self.device:
+            raise ValueError("Encoder and decoder must be on the same device")
+
         mel_rate = self.frontend.sample_rate / self.frontend.hop_length
-        if abs(mel_rate / 2.0 - wave_model.config.content_rate) > 1e-6:
-            raise ValueError("Frontend and waveform content rates do not match")
+        expected_content_rate = mel_rate / 2.0
+        if abs(expected_content_rate - decoder.config.content_rate) > 1e-6:
+            raise ValueError(
+                f"Frontend mel rate ({mel_rate} Hz) / 2 does not match "
+                f"decoder content rate ({decoder.config.content_rate} Hz)"
+            )
+
+        if encoder.config.content_dim != decoder.config.content_dim:
+            raise ValueError(
+                f"Encoder content_dim ({encoder.config.content_dim}) does not "
+                f"match decoder content_dim ({decoder.config.content_dim})"
+            )
 
         embedding = global_embedding.detach()
         if embedding.ndim == 1:
             embedding = embedding.unsqueeze(0)
-        expected_shape = (1, wave_model.config.condition_dim)
+        expected_shape = (1, decoder.config.condition_dim)
         if embedding.shape != expected_shape:
-            raise ValueError(
-                f"Global embedding must have shape {expected_shape}"
-            )
+            raise ValueError(f"Global embedding must have shape {expected_shape}")
         if not torch.isfinite(embedding).all():
             raise ValueError("Global embedding must be finite")
         self.global_embedding = embedding.to(self.device)
         self.reset()
-
-    @classmethod
-    def from_checkpoints(
-        cls,
-        content_checkpoint: str | Path,
-        wave_checkpoint: str | Path,
-        voicebank_path: str | Path,
-        *,
-        device: torch.device | str = "cpu",
-        frontend: Optional[StreamingLogMel] = None,
-        frontend_device: torch.device | str = "cpu",
-        return_cpu: bool = True,
-    ) -> StreamingVoiceConverter:
-        content_model, _ = load_content_checkpoint(
-            content_checkpoint,
-            device=device,
-        )
-        wave_model = load_wave_decoder(wave_checkpoint, device)
-        voicebank = VoiceBank.load(voicebank_path)
-        if voicebank.embedding_model != wave_model.config.condition_model:
-            raise ValueError(
-                "VoiceBank embedding model does not match waveform checkpoint"
-            )
-        return cls(
-            content_model,
-            wave_model,
-            voicebank.global_embedding,
-            frontend=frontend,
-            frontend_device=frontend_device,
-            return_cpu=return_cpu,
-        )
 
     @property
     def input_sample_rate(self) -> int:
@@ -197,12 +164,12 @@ class StreamingVoiceConverter:
 
     @property
     def output_sample_rate(self) -> int:
-        return self.wave_model.config.sample_rate
+        return self.decoder.config.sample_rate
 
     def reset(self) -> None:
         self.logmel_state: Optional[LogMelState] = None
-        self.content_state: Optional[StreamingState] = None
-        self.wave_state: Optional[WaveDecoderState] = None
+        self.encoder_state: Optional[ContentEncoderState] = None
+        self.decoder_state: Optional[SynthesisDecoderState] = None
         self.counters = PipelineCounters()
         self.finalized = False
 
@@ -217,19 +184,17 @@ class StreamingVoiceConverter:
         flush: bool,
         input_samples: int,
     ) -> StreamChunk:
-        content_output, self.content_state = self.content_model.forward_stream(
-            mel,
-            self.content_state,
-            flush=flush,
+        content_output, self.encoder_state = self.encoder.forward_stream(
+            mel, self.encoder_state, flush=flush,
         )
         content_frames = content_output.content.shape[-1]
         if content_frames == 0:
             audio = self._empty_audio()
         else:
-            audio, self.wave_state = self.wave_model.forward_stream(
-                content_output.content.transpose(1, 2),
-                self.global_embedding,
-                self.wave_state,
+            # Decoder expects (B, T, content_dim)
+            content_bt = content_output.content.transpose(1, 2)
+            audio, self.decoder_state = self.decoder.forward_stream(
+                content_bt, self.global_embedding, self.decoder_state,
             )
             if self.return_cpu:
                 audio = audio.cpu()
@@ -258,7 +223,7 @@ class StreamingVoiceConverter:
         if input_samples == 0:
             return StreamChunk(self._empty_audio(), 0, 0, 0)
         mel, self.logmel_state = self.frontend.forward_stream(
-            waveform.to(device=self.frontend_device, dtype=torch.float32),
+            waveform.to(dtype=torch.float32),
             self.logmel_state,
         )
         if mel.shape[-1] == 0:
@@ -280,17 +245,8 @@ class StreamingVoiceConverter:
         ):
             buffered = self.logmel_state.waveform_buffer.shape[-1]
             self.counters.unframed_tail_samples = max(0, buffered - overlap)
-        empty_mel = torch.empty(
-            1,
-            self.frontend.n_mels,
-            0,
-            device=self.device,
-        )
-        chunk = self._decode_mel(
-            empty_mel,
-            flush=True,
-            input_samples=0,
-        )
+        empty_mel = torch.empty(1, self.frontend.n_mels, 0, device=self.device)
+        chunk = self._decode_mel(empty_mel, flush=True, input_samples=0)
         self.finalized = True
         return chunk
 
@@ -302,7 +258,7 @@ class StreamingVoiceConverter:
         sample_count = self.frontend.n_fft + 2 * self.frontend.hop_length
         waveform = torch.zeros(sample_count)
         for start in range(0, sample_count, chunk_samples):
-            self.process(waveform[start : start + chunk_samples])
+            self.process(waveform[start: start + chunk_samples])
         self.flush()
         if self.device.type == "mps":
             torch.mps.synchronize()
