@@ -9,9 +9,41 @@ import torch.nn.functional as F
 DEFAULT_LEVELS = (8, 8, 8, 5, 5)
 
 
+def _levels_product(levels: Sequence[int]) -> int:
+    if not levels:
+        raise ValueError("levels must be non-empty")
+    product = 1
+    for level in levels:
+        if level <= 0:
+            raise ValueError("FSQ levels must be positive")
+        product *= int(level)
+    return product
+
+
+def _validate_token_indices(
+    indices: torch.Tensor, levels: Sequence[int] = DEFAULT_LEVELS
+) -> None:
+    if indices.dtype not in (
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    ):
+        raise TypeError("FSQ token indices must use an integer dtype")
+    codebook_size = _levels_product(levels)
+    if indices.numel() == 0:
+        return
+    if (indices < 0).any().item() or (indices >= codebook_size).any().item():
+        raise ValueError(
+            f"FSQ token indices must be in [0, {codebook_size})"
+        )
+
+
 def indices_to_level_indices(
     indices: torch.Tensor, levels: Sequence[int] = DEFAULT_LEVELS
 ) -> torch.Tensor:
+    _validate_token_indices(indices, levels)
     basis = []
     product = 1
     for level in levels:
@@ -71,7 +103,14 @@ def masked_fsq_cross_entropy(
     mask: torch.Tensor,
     levels: Sequence[int] = DEFAULT_LEVELS,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if len(logits) != len(levels):
+        raise ValueError("logits must contain one tensor per FSQ level")
+    if mask.shape != token_indices.shape:
+        raise ValueError("mask must have the same shape as token_indices")
     targets = indices_to_level_indices(token_indices, levels)
+    if not mask.any().item():
+        zero = logits[0].new_zeros(())
+        return zero, zero, zero
     losses = []
     accuracies = []
     predictions = []
@@ -85,12 +124,14 @@ def masked_fsq_cross_entropy(
             )
         )
         accuracies.append(
-            (prediction[mask] == targets[:, :, axis][mask]).float().mean()
+            (prediction[mask] == targets[:, :, axis][mask])
+            .to(dtype=axis_logits.dtype)
+            .mean()
         )
     predicted_levels = torch.stack(predictions, dim=-1)
     exact = (predicted_levels == targets).all(dim=-1)
     return (
         torch.stack(losses).mean(),
         torch.stack(accuracies).mean(),
-        exact[mask].float().mean(),
+        exact[mask].to(dtype=logits[0].dtype).mean(),
     )

@@ -80,10 +80,27 @@ class SynthesisDecoderConfig:
     def __post_init__(self) -> None:
         if self.content_dim <= 0 or self.condition_dim <= 0:
             raise ValueError("dimensions must be positive")
-        if self.transformer_dim % self.transformer_heads != 0:
+        if self.sample_rate <= 0 or self.content_rate <= 0:
+            raise ValueError("sample_rate and content_rate must be positive")
+        if (
+            self.transformer_heads <= 0
+            or self.transformer_dim % self.transformer_heads != 0
+        ):
             raise ValueError("transformer_dim must be divisible by transformer_heads")
+        if (self.transformer_dim // self.transformer_heads) % 2:
+            raise ValueError("transformer head dimension must be even for RoPE")
+        if self.transformer_window <= 0:
+            raise ValueError("transformer_window must be positive")
+        if self.resnet_blocks < 0:
+            raise ValueError("resnet_blocks must be non-negative")
+        if len(self.resnet_dilations) != self.resnet_blocks:
+            raise ValueError("resnet_blocks must match len(resnet_dilations)")
+        if self.resnet_kernel <= 0 or any(d <= 0 for d in self.resnet_dilations):
+            raise ValueError("resnet kernel and dilations must be positive")
         if len(self.stage_channels) != len(self.upsample_factors):
             raise ValueError("stage_channels and upsample_factors must align")
+        if self.sample_rate % self.internal_rate:
+            raise ValueError("sample_rate must be divisible by internal_rate")
         expected_product = self.sample_rate // self.internal_rate
         actual_product = math.prod(self.upsample_factors)
         if actual_product != expected_product:
@@ -440,6 +457,13 @@ class CausalSynthesisDecoder(nn.Module):
     ) -> tuple[torch.Tensor, SynthesisDecoderState]:
         if self.training:
             raise RuntimeError("forward_stream requires model.eval()")
+        if content.ndim != 3:
+            raise ValueError("content must have shape [batch, frames, content_dim]")
+        if content.shape[1] > 1:
+            raise ValueError(
+                "forward_stream accepts at most one content frame per call; "
+                "call it once per frame to preserve causal decoding"
+            )
 
         state = state or self.initial_state(
             batch_size=content.shape[0], device=content.device

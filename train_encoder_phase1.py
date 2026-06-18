@@ -86,8 +86,8 @@ def teacher_loss(
     target_flat = target[mask]
 
     if pred_flat.shape[0] == 0:
-        zero = torch.tensor(0.0, device=pred.device)
-        return zero, {"mse": 0.0, "cosine": 0.0}
+        zero = pred.sum() * 0.0
+        return zero, {"mse": 0.0, "cosine_loss": 0.0, "cosine_sim": 0.0}
 
     mse = F.mse_loss(pred_flat, target_flat)
     cosine = 1.0 - F.cosine_similarity(pred_flat, target_flat, dim=-1).mean()
@@ -150,6 +150,8 @@ def train(args):
     encoder.train()
     step = 0
     best_val_cosine = 0.0
+    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     log.info(f"Starting Phase 1 encoder warm-up for {args.steps} steps")
 
@@ -229,7 +231,7 @@ def train(args):
                         "state_dict": encoder.state_dict(),
                         "step": step,
                         "val_cosine": mean_cos,
-                    }, Path(args.checkpoint_dir) / "encoder_phase1.best.pt")
+                    }, checkpoint_dir / "encoder_phase1.best.pt")
                     log.info(f"  New best: {mean_cos:.4f}")
 
         if step % args.save_every == 0:
@@ -239,7 +241,7 @@ def train(args):
                 "state_dict": encoder.state_dict(),
                 "step": step,
                 "optimizer": optimizer.state_dict(),
-            }, Path(args.checkpoint_dir) / "encoder_phase1.last.pt")
+            }, checkpoint_dir / "encoder_phase1.last.pt")
 
     log.info(f"Phase 1 complete. Best val cosine: {best_val_cosine:.4f}")
 

@@ -26,6 +26,55 @@ from torch.utils.data import DataLoader, Dataset
 from astrape.decoder import CausalSynthesisDecoder, SynthesisDecoderConfig, save_decoder_checkpoint
 from astrape.voicebank import VoiceBank
 
+
+def load_voicebank_dir(
+    directory: Path,
+    *,
+    expected_model: str,
+    expected_dim: int,
+) -> dict[str, torch.Tensor]:
+    """Load .astrape files keyed by stem, validating decoder compatibility."""
+    if not directory.exists():
+        raise FileNotFoundError(f"VoiceBank directory not found: {directory}")
+    if not directory.is_dir():
+        raise NotADirectoryError(f"VoiceBank path is not a directory: {directory}")
+
+    embeddings = {}
+    for f in sorted(directory.glob("*.astrape")):
+        bank = VoiceBank.load(f)
+        if bank.embedding_model != expected_model:
+            raise ValueError(
+                f"VoiceBank {f.name} uses embedding_model={bank.embedding_model!r}; "
+                f"decoder expects condition_model={expected_model!r}"
+            )
+        embedding = bank.global_embedding.detach().float()
+        if embedding.shape != (expected_dim,):
+            raise ValueError(
+                f"VoiceBank {f.name} embedding shape {tuple(embedding.shape)} "
+                f"does not match decoder condition_dim={expected_dim}"
+            )
+        embeddings[f.stem] = embedding.clone()
+    if not embeddings:
+        raise ValueError(f"No .astrape VoiceBank files found in {directory}")
+    return embeddings
+
+
+def validate_voicebank_coverage(
+    speakers: np.ndarray,
+    speaker_embeddings: dict[str, torch.Tensor],
+) -> None:
+    """Require every dataset speaker to have a matching .astrape stem."""
+    required = sorted(set(map(str, speakers)))
+    missing = [speaker for speaker in required if speaker not in speaker_embeddings]
+    if missing:
+        shown = ", ".join(missing[:10])
+        suffix = "" if len(missing) <= 10 else f", ... (+{len(missing) - 10} more)"
+        raise ValueError(
+            "VoiceBank speaker coverage mismatch: missing embeddings for "
+            f"{len(missing)}/{len(required)} dataset speakers: {shown}{suffix}. "
+            ".astrape file stems must match meta.npz spk_names exactly."
+        )
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
 
@@ -76,11 +125,13 @@ class DecoderPretrainDataset(Dataset):
         self,
         data_dir: str | Path,
         audio_root: str | Path,
+        speaker_embeddings: dict[str, torch.Tensor],
         target_sr: int = 44100,
         max_content_frames: int = 100,
     ):
         self.data_dir = Path(data_dir)
         self.audio_root = Path(audio_root)
+        self.speaker_embeddings = speaker_embeddings
         self.target_sr = target_sr
         self.max_content_frames = max_content_frames
 
@@ -88,9 +139,6 @@ class DecoderPretrainDataset(Dataset):
         self.n_samples = int(meta["n_samples"])
         self.source_files = meta["source_files"][: self.n_samples]
         self.speakers = meta["spk_names"][: self.n_samples].astype(str)
-
-        # Build speaker → global embedding map (loaded lazily)
-        self._speaker_embeddings: dict[str, torch.Tensor] = {}
 
     def __len__(self) -> int:
         return self.n_samples
@@ -141,10 +189,15 @@ class DecoderPretrainDataset(Dataset):
                 audio_start = start * 1764
                 waveform = waveform[audio_start : audio_start + self.max_content_frames * 1764]
 
+            # Speaker embedding: same-speaker conditioning (source == target in Phase 0)
+            spk_name = self.speakers[index]
+            spk_emb = self.speaker_embeddings.get(spk_name)
+
             return {
                 "content": ce_768,
                 "waveform": waveform,
-                "speaker": self.speakers[index],
+                "speaker": spk_name,
+                "speaker_embedding": spk_emb,
             }
         except (FileNotFoundError, Exception) as e:
             return None
@@ -159,21 +212,34 @@ def collate_skip_none(batch):
 
     contents = []
     waveforms = []
+    embeddings = []
+    embedding_flags = [b["speaker_embedding"] is not None for b in batch]
+    has_embeddings = all(embedding_flags)
+    if any(embedding_flags) and not has_embeddings:
+        missing = [str(b["speaker"]) for b in batch if b["speaker_embedding"] is None]
+        raise ValueError(
+            "Batch has partial speaker embedding coverage; missing "
+            f"{', '.join(missing[:10])}"
+        )
     for b in batch:
         c = b["content"]
         w = b["waveform"]
-        # Pad to max
         if c.shape[0] < max_frames:
             c = F.pad(c, (0, 0, 0, max_frames - c.shape[0]))
         if w.shape[0] < max_samples:
             w = F.pad(w, (0, max_samples - w.shape[0]))
         contents.append(c)
         waveforms.append(w)
+        if has_embeddings:
+            embeddings.append(b["speaker_embedding"])
 
-    return {
+    result = {
         "content": torch.stack(contents),
         "waveform": torch.stack(waveforms),
     }
+    if has_embeddings:
+        result["speaker_embedding"] = torch.stack(embeddings)
+    return result
 
 
 # --- Training Loop ---
@@ -199,12 +265,28 @@ def train(args):
         optimizer, T_max=args.steps, eta_min=args.lr * 0.01
     )
 
+    # Load voicebank for speaker embeddings
+    speaker_embeddings: dict[str, torch.Tensor] = {}
+    voicebank_dir = Path(args.voicebank_dir) if args.voicebank_dir else None
+    if voicebank_dir is not None:
+        speaker_embeddings = load_voicebank_dir(
+            voicebank_dir,
+            expected_model=config.condition_model,
+            expected_dim=config.condition_dim,
+        )
+        log.info(f"Loaded {len(speaker_embeddings)} speaker embeddings from {voicebank_dir}")
+    else:
+        log.warning("No voicebank provided - using random speaker embeddings per batch")
+
     # Data
     dataset = DecoderPretrainDataset(
         args.data_dir, args.audio_root,
+        speaker_embeddings=speaker_embeddings,
         target_sr=config.sample_rate,
         max_content_frames=args.max_frames,
     )
+    if voicebank_dir is not None:
+        validate_voicebank_coverage(dataset.speakers, speaker_embeddings)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -215,11 +297,6 @@ def train(args):
         pin_memory=True,
     )
 
-    # Load global embeddings for conditioning
-    # For pretraining we use a fixed set or random conditioning
-    # since we don't have per-utterance global embeddings in the cache.
-    # We'll use the voicebank if available, otherwise random 128d.
-    voicebank_dir = Path(args.voicebank_dir) if args.voicebank_dir else None
 
     # Training loop
     step = 0
@@ -238,9 +315,17 @@ def train(args):
             content = batch["content"].to(device)
             waveform = batch["waveform"].to(device)
 
-            # Use zero global embedding for now (decoder must still use content)
-            # In practice, we'd load per-speaker embeddings
-            global_emb = torch.zeros(content.shape[0], 128, device=device)
+            # Real speaker embeddings so AdaLN gates learn conditioning from day one
+            if "speaker_embedding" in batch:
+                global_emb = batch["speaker_embedding"].to(device)
+            elif voicebank_dir is not None:
+                raise RuntimeError(
+                    "VoiceBank was provided but this batch has no speaker embeddings"
+                )
+            else:
+                # Fallback: random unit-norm embeddings (still non-zero, forces gates to activate)
+                global_emb = torch.randn(content.shape[0], config.condition_dim, device=device)
+                global_emb = F.normalize(global_emb, dim=-1)
 
             # Forward
             pred = model(content, global_emb)

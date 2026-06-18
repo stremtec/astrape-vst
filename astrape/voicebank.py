@@ -56,6 +56,7 @@ ASTRAPE_HEADER_SIZE = 48
 ASTRAPE_HEADER_FMT = "<4sIIIQIQIQ"
 ASTRAPE_EMBEDDING_DIM = 128
 ASTRAPE_EMBEDDING_BYTES = ASTRAPE_EMBEDDING_DIM * 4
+ASTRAPE_EMBEDDING_DTYPE = np.dtype("<f4")
 ASTRAPE_FLAG_HAS_EMBEDDING = 1 << 0
 
 MIN_REFERENCE_SECONDS = 5.0
@@ -273,7 +274,9 @@ class VoiceBank:
                 metadata_blob = handle.read(header["metadata_length"])
         else:
             return _read_npz(path)
-        return _build_from_astrape(embedding_blob, metadata_blob)
+        bank = _build_from_astrape(embedding_blob, metadata_blob)
+        bank.validate()
+        return bank
 
 
 # Format detection -----------------------------------------------------------------
@@ -339,7 +342,9 @@ def _write_astrape(path: Path, bank: VoiceBank) -> Path:
             f"VoiceBank embedding must have shape "
             f"[{ASTRAPE_EMBEDDING_DIM}] (got {tuple(embedding.shape)})"
         )
-    embedding_bytes = embedding.numpy().astype(np.float32, copy=False).tobytes()
+    embedding_bytes = embedding.numpy().astype(
+        ASTRAPE_EMBEDDING_DTYPE, copy=False
+    ).tobytes()
     if len(embedding_bytes) != ASTRAPE_EMBEDDING_BYTES:
         raise ValueError("VoiceBank embedding must be float32 contiguous")
     metadata_bytes = _metadata_json_bytes(bank)
@@ -375,6 +380,16 @@ def parse_astrape_header(buffer: bytes) -> dict[str, int]:
      _r1) = struct.unpack(ASTRAPE_HEADER_FMT, buffer[:ASTRAPE_HEADER_SIZE])
     if version != VOICEBANK_FORMAT_VERSION:
         raise ValueError(f"unsupported .astrape version: {version}")
+    if flags & ASTRAPE_FLAG_HAS_EMBEDDING == 0:
+        raise ValueError(".astrape file does not contain an embedding")
+    if embedding_length != ASTRAPE_EMBEDDING_BYTES:
+        raise ValueError(
+            f"unexpected embedding byte length: {embedding_length}"
+        )
+    if embedding_offset < ASTRAPE_HEADER_SIZE:
+        raise ValueError("embedding overlaps .astrape header")
+    if metadata_offset < embedding_offset + embedding_length:
+        raise ValueError("metadata overlaps .astrape embedding")
     return {
         "flags": flags,
         "embedding_offset": embedding_offset,
@@ -385,11 +400,12 @@ def parse_astrape_header(buffer: bytes) -> dict[str, int]:
 
 
 def _build_from_astrape(embedding_blob: bytes, metadata_blob: bytes) -> VoiceBank:
-    array = np.frombuffer(embedding_blob, dtype=np.float32)
+    array = np.frombuffer(embedding_blob, dtype=ASTRAPE_EMBEDDING_DTYPE)
     if array.shape != (ASTRAPE_EMBEDDING_DIM,):
         raise ValueError(
             f"unexpected embedding shape: {array.shape!r}"
         )
+    array = array.astype(np.float32, copy=False)
     payload = json.loads(metadata_blob.decode("utf-8"))
     return VoiceBank(
         global_embedding=torch.from_numpy(array.copy()).float(),
@@ -444,12 +460,13 @@ def header_peek(path: str | Path) -> dict[str, Any]:
 
 
 def open_embedding_mmap(path: str | Path) -> "_MmapEmbeddingHandle":
-    """Open the embedding as a zero-copy read-only mmap view.
+    """Open the embedding as a read-only array handle.
 
-    ``.astrape`` files yield a real ``mmap.mmap``-backed NumPy view. Legacy
+    ``.astrape`` files yield a real ``mmap.mmap``-backed NumPy view. Keep the
+    handle open while reading ``array``; use ``tensor()`` for an owning copy
+    that may outlive the handle. Legacy
     ``.npz`` files fall back to ``np.load`` (no zero-copy possible because
-    NumPy cannot memory-map a ZIP container), but the resulting tensor is
-    identical to the on-disk bytes.
+    NumPy cannot memory-map a ZIP container), returning an owning array copy.
     """
     path = Path(path)
     fmt = detect_format(path)
@@ -465,13 +482,20 @@ def open_embedding_mmap(path: str | Path) -> "_MmapEmbeddingHandle":
     try:
         raw_header = file_handle.read(ASTRAPE_HEADER_SIZE)
         header = parse_astrape_header(raw_header)
+        file_size = path.stat().st_size
+        embedding_end = header["embedding_offset"] + header["embedding_length"]
+        metadata_end = header["metadata_offset"] + header["metadata_length"]
+        if embedding_end > file_size or metadata_end > file_size:
+            raise ValueError(".astrape header points past end of file")
         mm = mmap.mmap(file_handle.fileno(), 0, access=mmap.ACCESS_READ)
     except Exception:
         file_handle.close()
         raise
-    buffer = np.frombuffer(
-        mm[header["embedding_offset"]: header["embedding_offset"] + header["embedding_length"]],
-        dtype=np.float32,
+    buffer = np.ndarray(
+        shape=(ASTRAPE_EMBEDDING_DIM,),
+        dtype=ASTRAPE_EMBEDDING_DTYPE,
+        buffer=mm,
+        offset=header["embedding_offset"],
     )
     return _MmapEmbeddingHandle(buffer, own_buffer=False, mmap=mm, file=file_handle)
 
@@ -485,13 +509,16 @@ class _MmapEmbeddingHandle:
 
     def tensor(self) -> torch.Tensor:
         # Always clone so the caller may outlive this handle safely.
-        return torch.from_numpy(self.array.copy())
+        return torch.from_numpy(self.array.astype(np.float32, copy=True))
 
     def close(self) -> None:
+        self.array = np.asarray((), dtype=ASTRAPE_EMBEDDING_DTYPE)
         if self.mmap is not None:
             self.mmap.close()
+            self.mmap = None
         if self.file is not None:
             self.file.close()
+            self.file = None
 
     def __enter__(self) -> "_MmapEmbeddingHandle":
         return self

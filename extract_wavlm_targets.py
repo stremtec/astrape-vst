@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -46,6 +47,76 @@ def resolve_audio(source_file: str, audio_root: Path) -> Path:
     raise FileNotFoundError(f"Cannot find: {source_file}")
 
 
+def cached_content_length(data_dir: Path, index: int) -> int | None:
+    sample_path = data_dir / f"s_{index:05d}.npz"
+    if not sample_path.exists():
+        return None
+    with np.load(sample_path) as data:
+        if "ce_768" not in data:
+            return None
+        return int(data["ce_768"].shape[0])
+
+
+def align_target_frames(
+    wavlm_25hz: np.ndarray,
+    content_length: int | None,
+) -> np.ndarray:
+    """Align WavLM targets to cached content length when available."""
+    if content_length is None or wavlm_25hz.shape[0] == content_length:
+        return wavlm_25hz
+    if wavlm_25hz.ndim != 2:
+        raise ValueError(f"wavlm_25hz must be 2D, got shape {wavlm_25hz.shape}")
+    if content_length < 0:
+        raise ValueError("content_length must be non-negative")
+    if content_length == 0:
+        return wavlm_25hz[:0]
+    if wavlm_25hz.shape[0] > content_length:
+        return wavlm_25hz[:content_length]
+    if wavlm_25hz.shape[0] == 0:
+        raise ValueError("Cannot pad an empty WavLM target")
+    pad_count = content_length - wavlm_25hz.shape[0]
+    padding = np.repeat(wavlm_25hz[-1:], pad_count, axis=0)
+    return np.concatenate([wavlm_25hz, padding], axis=0)
+
+
+def is_valid_ssl_cache(path: Path, content_length: int | None = None) -> bool:
+    if not path.exists():
+        return False
+    try:
+        with np.load(path) as data:
+            if "wavlm_25hz" not in data:
+                return False
+            target = data["wavlm_25hz"]
+            if target.ndim != 2 or target.shape[1] != 768:
+                return False
+            if content_length is not None and target.shape[0] != content_length:
+                return False
+    except Exception:
+        return False
+    return True
+
+
+def save_npz_atomic(path: Path, **arrays: np.ndarray) -> None:
+    """Write an NPZ through a same-directory temp file, then atomically replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        with tmp_path.open("wb") as handle:
+            np.savez_compressed(handle, **arrays)
+        tmp_path.replace(path)
+        try:
+            with np.load(path) as data:
+                for key, array in arrays.items():
+                    if key not in data or data[key].shape != array.shape:
+                        raise ValueError(f"atomic write validation failed for {key}")
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
 def main(args):
     device = torch.device(args.device)
     data_dir = Path(args.data_dir)
@@ -64,7 +135,10 @@ def main(args):
     start_idx = 0
     if args.resume:
         for i in range(n_samples):
-            if not (data_dir / f"ssl_{i:05d}.npz").exists():
+            content_length = cached_content_length(data_dir, i)
+            if not is_valid_ssl_cache(
+                data_dir / f"ssl_{i:05d}.npz", content_length
+            ):
                 start_idx = i
                 break
         else:
@@ -77,7 +151,8 @@ def main(args):
 
     for i in range(start_idx, n_samples):
         out_path = data_dir / f"ssl_{i:05d}.npz"
-        if out_path.exists():
+        content_length = cached_content_length(data_dir, i)
+        if is_valid_ssl_cache(out_path, content_length):
             done += 1
             continue
 
@@ -104,7 +179,8 @@ def main(args):
                     ssl_50hz.transpose(1, 2), kernel_size=2, stride=2
                 ).transpose(1, 2).squeeze(0).cpu().numpy()  # (T_25hz, 768)
 
-            np.savez_compressed(out_path, wavlm_25hz=ssl_25hz)
+            ssl_25hz = align_target_frames(ssl_25hz, content_length)
+            save_npz_atomic(out_path, wavlm_25hz=ssl_25hz)
             done += 1
 
         except Exception as e:

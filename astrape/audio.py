@@ -72,7 +72,9 @@ class StreamingLogMel:
         if waveform.ndim == 1:
             waveform = waveform.unsqueeze(0)
         if waveform.ndim != 2:
-            raise ValueError("waveform must have shape (samples,) or (batch, samples)")
+            raise ValueError(
+                "waveform must have shape (samples,) or (batch, samples)"
+            )
         return self._extract(waveform)
 
     def forward_stream(
@@ -80,6 +82,10 @@ class StreamingLogMel:
     ) -> tuple[torch.Tensor, LogMelState]:
         if waveform.ndim == 1:
             waveform = waveform.unsqueeze(0)
+        if waveform.ndim != 2:
+            raise ValueError(
+                "waveform must have shape (samples,) or (batch, samples)"
+            )
         state = state or LogMelState()
         if state.waveform_buffer is None:
             joined = waveform

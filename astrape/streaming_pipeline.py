@@ -135,6 +135,11 @@ class StreamingVoiceConverter:
 
         mel_rate = self.frontend.sample_rate / self.frontend.hop_length
         expected_content_rate = mel_rate / 2.0
+        if self.frontend.n_mels != encoder.config.mel_dim:
+            raise ValueError(
+                f"Frontend n_mels ({self.frontend.n_mels}) does not match "
+                f"encoder mel_dim ({encoder.config.mel_dim})"
+            )
         if abs(expected_content_rate - decoder.config.content_rate) > 1e-6:
             raise ValueError(
                 f"Frontend mel rate ({mel_rate} Hz) / 2 does not match "
@@ -191,11 +196,17 @@ class StreamingVoiceConverter:
         if content_frames == 0:
             audio = self._empty_audio()
         else:
-            # Decoder expects (B, T, content_dim)
-            content_bt = content_output.content.transpose(1, 2)
-            audio, self.decoder_state = self.decoder.forward_stream(
-                content_bt, self.global_embedding, self.decoder_state,
-            )
+            # Decode one frame at a time to preserve strict causality
+            # (multi-frame chunks lack an intra-chunk causal mask in the decoder)
+            content_bt = content_output.content.transpose(1, 2)  # (B, T, D)
+            audio_chunks = []
+            for t in range(content_frames):
+                frame = content_bt[:, t:t+1, :]
+                chunk_audio, self.decoder_state = self.decoder.forward_stream(
+                    frame, self.global_embedding, self.decoder_state,
+                )
+                audio_chunks.append(chunk_audio)
+            audio = torch.cat(audio_chunks, dim=-1)
             if self.return_cpu:
                 audio = audio.cpu()
         self.counters.mel_frames += mel.shape[-1]

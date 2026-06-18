@@ -289,6 +289,9 @@ def masked_content_loss(
     prediction = prediction[:, :length]
     target = target[:, :length]
     mask = mask[:, :length]
+    if length == 0 or not mask.any():
+        zero = prediction.sum() * 0.0
+        return zero, zero
     cosine = F.cosine_similarity(prediction, target, dim=-1)
     cosine_mean = cosine.masked_select(mask).mean()
     expanded_mask = mask.unsqueeze(-1).expand_as(prediction)

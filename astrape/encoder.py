@@ -122,20 +122,35 @@ class CausalConvNeXtBlock(nn.Module):
 class RoPE(nn.Module):
     def __init__(self, dim: int, max_len: int = 4096, theta: float = 10000.0):
         super().__init__()
-        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-        t = torch.arange(max_len).float()
-        angles = torch.outer(t, freqs)
-        cos = angles.cos()
-        sin = angles.sin()
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
+        if dim <= 0 or dim % 2:
+            raise ValueError("RoPE dimension must be a positive even integer")
+        self.dim = dim
+        self.max_len = max_len
+        self.theta = theta
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(
         self, x: torch.Tensor, offset: int = 0
     ) -> torch.Tensor:
+        if offset < 0:
+            raise ValueError("RoPE offset must be non-negative")
         seq_len = x.shape[-2]
-        cos = self.cos[offset : offset + seq_len].unsqueeze(0).unsqueeze(0)
-        sin = self.sin[offset : offset + seq_len].unsqueeze(0).unsqueeze(0)
+        if seq_len == 0:
+            return x
+        compute_dtype = x.dtype
+        if compute_dtype in (torch.float16, torch.bfloat16):
+            compute_dtype = torch.float32
+        positions = torch.arange(
+            offset,
+            offset + seq_len,
+            device=x.device,
+            dtype=compute_dtype,
+        )
+        inv_freq = self.inv_freq.to(device=x.device, dtype=compute_dtype)
+        angles = torch.outer(positions, inv_freq)
+        cos = angles.cos().to(dtype=x.dtype).unsqueeze(0).unsqueeze(0)
+        sin = angles.sin().to(dtype=x.dtype).unsqueeze(0).unsqueeze(0)
         x1, x2 = x.unflatten(-1, (-1, 2)).unbind(-1)
         return torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1).flatten(-2)
 
@@ -327,6 +342,15 @@ class FSQBottleneck(nn.Module):
     @staticmethod
     def _quantize(z: torch.Tensor, levels: Sequence[int]) -> torch.Tensor:
         quantized = z.round()
+        lower = torch.tensor(
+            [-(level // 2) for level in levels], device=z.device, dtype=z.dtype
+        )
+        upper = torch.tensor(
+            [level - level // 2 - 1 for level in levels],
+            device=z.device,
+            dtype=z.dtype,
+        )
+        quantized = quantized.clamp(min=lower, max=upper)
         return z + (quantized - z).detach()
 
     @staticmethod

@@ -11,6 +11,45 @@ from astrape.decoder import CausalSynthesisDecoder, SynthesisDecoderConfig
 from astrape.streaming_pipeline import StreamingVoiceConverter
 
 
+def tiny_encoder_config() -> EncoderConfig:
+    return EncoderConfig(
+        mel_dim=4,
+        content_dim=8,
+        frontend_dim=4,
+        frontend_kernel=1,
+        convnext_kernel=1,
+        n_convnext_blocks=0,
+        transformer_dim=4,
+        transformer_heads=1,
+        transformer_layers=1,
+        transformer_ff_mult=1,
+        transformer_window=2,
+        fsq_levels=(3, 3),
+    )
+
+
+def tiny_decoder_config() -> SynthesisDecoderConfig:
+    return SynthesisDecoderConfig(
+        content_dim=4,
+        condition_dim=3,
+        sample_rate=4,
+        content_rate=1,
+        transformer_dim=4,
+        transformer_heads=1,
+        transformer_layers=1,
+        transformer_ff_mult=1,
+        transformer_window=2,
+        resnet_blocks=1,
+        resnet_kernel=1,
+        resnet_dilations=(1,),
+        stage_channels=(4,),
+        upsample_factors=(2,),
+        mrf_kernel_sizes=(1,),
+        mrf_dilations=((1,),),
+        output_kernel_size=1,
+    )
+
+
 class EncoderStreamingTests(unittest.TestCase):
     def setUp(self):
         self.config = EncoderConfig()
@@ -66,6 +105,36 @@ class EncoderStreamingTests(unittest.TestCase):
         out2, _ = self.model.forward_stream(empty, state, flush=True)
         self.assertEqual(out2.content.shape[-1], 0)
 
+    def test_streaming_past_rope_initial_table_length(self):
+        config = tiny_encoder_config()
+        model = CausalContentEncoder(config)
+        model.eval()
+        old_table_len = config.transformer_window * 4
+        mel = torch.randn(1, config.mel_dim, (old_table_len + 3) * 2)
+
+        state = None
+        chunks = []
+        for t in range(mel.shape[-1]):
+            out, state = model.forward_stream(mel[:, :, t:t+1], state)
+            if out.content.shape[-1] > 0:
+                chunks.append(out.content)
+
+        streamed = torch.cat(chunks, dim=-1)
+        self.assertEqual(state.cache_len, old_table_len + 3)
+        self.assertEqual(streamed.shape[-1], old_table_len + 3)
+
+    def test_full_forward_past_rope_initial_table_length(self):
+        config = tiny_encoder_config()
+        model = CausalContentEncoder(config)
+        model.eval()
+        old_table_len = config.transformer_window * 4
+        mel = torch.randn(1, config.mel_dim, (old_table_len + 3) * 2)
+
+        with torch.no_grad():
+            out = model(mel)
+
+        self.assertEqual(out.content.shape[-1], old_table_len + 3)
+
 
 class DecoderStreamingTests(unittest.TestCase):
     def setUp(self):
@@ -90,6 +159,64 @@ class DecoderStreamingTests(unittest.TestCase):
         streamed = torch.cat(chunks, dim=-1)
         diff = (full_audio[:, :streamed.shape[-1]] - streamed).abs().max().item()
         self.assertLess(diff, 1e-4)
+
+    def test_streaming_past_rope_initial_table_length(self):
+        config = tiny_decoder_config()
+        model = CausalSynthesisDecoder(config)
+        model.eval()
+        old_table_len = config.transformer_window * 4
+        content = torch.randn(1, old_table_len + 3, config.content_dim)
+        spk = torch.randn(1, config.condition_dim)
+
+        state = None
+        chunks = []
+        for t in range(content.shape[1]):
+            with torch.no_grad():
+                audio_chunk, state = model.forward_stream(
+                    content[:, t:t+1, :], spk, state,
+                )
+            chunks.append(audio_chunk)
+
+        streamed = torch.cat(chunks, dim=-1)
+        self.assertEqual(state.cache_len, old_table_len + 3)
+        self.assertEqual(
+            streamed.shape[-1],
+            (old_table_len + 3) * config.samples_per_frame,
+        )
+
+    def test_full_forward_past_rope_initial_table_length(self):
+        config = tiny_decoder_config()
+        model = CausalSynthesisDecoder(config)
+        model.eval()
+        old_table_len = config.transformer_window * 4
+        content = torch.randn(1, old_table_len + 3, config.content_dim)
+        spk = torch.randn(1, config.condition_dim)
+
+        with torch.no_grad():
+            audio = model(content, spk)
+
+        self.assertEqual(
+            audio.shape[-1],
+            (old_table_len + 3) * config.samples_per_frame,
+        )
+
+    def test_forward_stream_rejects_multi_frame_content(self):
+        config = tiny_decoder_config()
+        model = CausalSynthesisDecoder(config)
+        model.eval()
+        content = torch.randn(1, 2, config.content_dim)
+        spk = torch.randn(1, config.condition_dim)
+
+        with self.assertRaisesRegex(ValueError, "at most one content frame"):
+            model.forward_stream(content, spk)
+
+    def test_config_rejects_sample_rate_not_divisible_by_internal_rate(self):
+        with self.assertRaisesRegex(ValueError, "divisible by internal_rate"):
+            SynthesisDecoderConfig(sample_rate=44101)
+
+    def test_config_rejects_resnet_block_dilation_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "resnet_blocks"):
+            SynthesisDecoderConfig(resnet_blocks=2, resnet_dilations=(1,))
 
 
 class PipelineTests(unittest.TestCase):
@@ -130,6 +257,12 @@ class PipelineTests(unittest.TestCase):
         bad_encoder = CausalContentEncoder(EncoderConfig(content_dim=256))
         bad_encoder.eval()
         with self.assertRaises(ValueError):
+            StreamingVoiceConverter(bad_encoder, self.decoder, self.embedding)
+
+    def test_mel_dimension_mismatch_raises(self):
+        bad_encoder = CausalContentEncoder(EncoderConfig(mel_dim=64))
+        bad_encoder.eval()
+        with self.assertRaisesRegex(ValueError, "n_mels.*mel_dim"):
             StreamingVoiceConverter(bad_encoder, self.decoder, self.embedding)
 
 
