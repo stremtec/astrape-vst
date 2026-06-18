@@ -1,24 +1,18 @@
-"""Core models and utilities for Astrape VC."""
+"""Core infrastructure for Astrape VC."""
 
-from .checkpoint import load_content_checkpoint, save_checkpoint
-from .mel_decoder import CausalMelDecoder, MelDecoderConfig
-from .model import ContentStudent, ContentStudentConfig, StreamingState
+from .decoder import CausalSynthesisDecoder, SynthesisDecoderConfig
+from .encoder import CausalContentEncoder, ContentEncoderState, ContentOutput, EncoderConfig
 from .streaming_pipeline import OutputRingBuffer, StreamingVoiceConverter
 from .voicebank import VoiceBank
-from .wave_decoder import DirectWaveDecoder, WaveDecoderConfig, WaveDecoderState
 
 __all__ = [
-    "CausalMelDecoder",
-    "ContentStudent",
-    "ContentStudentConfig",
-    "DirectWaveDecoder",
-    "MelDecoderConfig",
+    "CausalContentEncoder",
+    "CausalSynthesisDecoder",
+    "ContentEncoderState",
+    "ContentOutput",
+    "EncoderConfig",
     "OutputRingBuffer",
-    "StreamingState",
     "StreamingVoiceConverter",
+    "SynthesisDecoderConfig",
     "VoiceBank",
-    "WaveDecoderConfig",
-    "WaveDecoderState",
-    "load_content_checkpoint",
-    "save_checkpoint",
 ]

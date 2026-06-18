@@ -4,26 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "astrape-vc"
-version = "0.2.0"
-description = "Causal teacher-student components for zero-shot voice conversion"
+version = "0.3.0"
+description = "Real-time causal zero-shot voice conversion"
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.26",
   "scipy>=1.11",
   "soundfile>=0.12",
   "torch>=2.2",
-  "torchfcpe>=0.0.4",
   "torchaudio>=2.2",
-  "fastapi>=0.115",
-  "python-multipart>=0.0.20",
-  "uvicorn[standard]>=0.34",
 ]
 
 [tool.setuptools.packages.find]
-include = ["astrape*", "webui*"]
-
-[tool.setuptools.package-data]
-webui = ["static/*"]
-
-[project.scripts]
-astrape-webui = "webui.server:main"
+include = ["astrape*"]

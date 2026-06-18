@@ -1,1 +1,0 @@
-"""Astrape local WebUI."""

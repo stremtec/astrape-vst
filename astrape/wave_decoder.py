@@ -9,8 +9,37 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .model import CausalConv1d
 from .voicebank import MIO_GLOBAL_MODEL
+
+
+class CausalConv1d(nn.Conv1d):
+    """Conv1d with left-only padding and a stateful streaming path."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs["padding"] = 0
+        super().__init__(*args, **kwargs)
+
+    @property
+    def left_context(self) -> int:
+        return self.dilation[0] * (self.kernel_size[0] - 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.left_context:
+            x = F.pad(x, (self.left_context, 0))
+        return super().forward(x)
+
+    def forward_stream(
+        self,
+        x: torch.Tensor,
+        cache: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        context = self.left_context
+        if cache is None:
+            cache = x.new_zeros(x.shape[0], x.shape[1], context)
+        joined = torch.cat((cache, x), dim=-1)
+        out = super().forward(joined)
+        next_cache = joined[:, :, -context:] if context else joined[:, :, :0]
+        return out, next_cache
 
 
 @dataclass(frozen=True)

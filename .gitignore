@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 *.egg-info/
+.cache/
+.pytest_cache/
 .webui/
 *.pt
 *.pth
@@ -14,8 +16,10 @@ logs/
 checkpoints/
 outputs/
 data/
+.DS_Store
 
-# Markdown (all .md except README.md)
+# Markdown (all .md except README.md and Architecture.md)
 CLAUDE.md
 *.md
 !README.md
+!Architecture.md
