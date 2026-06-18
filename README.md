@@ -75,3 +75,21 @@ A VoiceBank stores a single 128d speaker embedding from a 5+ second reference re
 Python 3.10+, PyTorch 2.2+, torchaudio, numpy, scipy, soundfile.
 
 MioCodec teacher inference requires the separate `.venv-mio` environment.
+
+## Reference paper
+
+[https://arxiv.org/abs/2604.12456](https://arxiv.org/abs/2604.12456)
+
+[https://arxiv.org/abs/2401.03078](https://arxiv.org/abs/2401.03078)
+
+[https://arxiv.org/abs/2602.00594](https://arxiv.org/abs/2602.00594)
+
+[https://aclanthology.org/2024.findings-acl.681/](https://aclanthology.org/2024.findings-acl.681/)
+
+[https://arxiv.org/abs/2110.01900](https://arxiv.org/abs/2110.01900)
+
+[https://arxiv.org/abs/2202.01855](https://arxiv.org/abs/2202.01855)
+
+[https://arxiv.org/abs/2309.15505](https://arxiv.org/abs/2309.15505)
+
+
