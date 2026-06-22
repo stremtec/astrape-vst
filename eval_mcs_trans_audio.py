@@ -30,7 +30,11 @@ warnings.filterwarnings("ignore")
 sys.path.insert(0, "external/MioCodec/src")
 
 from train_mcs_trans import MCSTrans, MCSTransConfig  # noqa: E402
-from mcs_calibrator import load_calibrator  # noqa: E402
+# Optional: calibrator support (may not be available)
+try:
+    from mcs_calibrator import load_calibrator  # noqa: E402
+except ImportError:
+    load_calibrator = None  # type: ignore
 
 
 MIO_CONFIG = Path(
@@ -158,6 +162,8 @@ def main() -> None:
     print(f"  params={sum(p.numel() for p in mcs.parameters()):,}")
     calibrator = None
     if args.calibrator is not None:
+        if load_calibrator is None:
+            raise RuntimeError("calibrator requested but mcs_calibrator module not available")
         print(f"Loading content calibrator from {args.calibrator}")
         calibrator = load_calibrator(args.calibrator, device)
         print(f"  params={sum(p.numel() for p in calibrator.parameters()):,}")

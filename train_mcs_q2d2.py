@@ -858,7 +858,7 @@ def main() -> None:
                         src_path = Path(str(source_files[row]))
                         if src_path.exists():
                             from eval_mcs_trans_audio import load_wave, SAMPLE_RATE  # noqa: E402
-                            from train_mcs_original_calibrator import multi_resolution_stft_loss  # noqa: E402
+                            from mcs_common import multi_resolution_stft_loss  # noqa: E402
                             orig_wave = load_wave(src_path, SAMPLE_RATE,
                                                   max_seconds=3.0).to(device)
                             with torch.no_grad():

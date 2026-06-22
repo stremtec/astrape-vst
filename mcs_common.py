@@ -410,3 +410,36 @@ def save_checkpoint(
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, tmp)
     tmp.replace(path)
+
+
+# ── STFT / MR-STFT loss (shared by decoder-in-loop) ──
+
+def stft_mag(wave: torch.Tensor, n_fft: int) -> torch.Tensor:
+    hop = n_fft // 4
+    window = torch.hann_window(n_fft, device=wave.device, dtype=wave.dtype)
+    spec = torch.stft(
+        wave, n_fft=n_fft, hop_length=hop, win_length=n_fft,
+        window=window, return_complex=True,
+    )
+    return spec.abs().clamp_min(1e-7)
+
+
+def multi_resolution_stft_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    n_ffts: tuple[int, ...],
+) -> torch.Tensor:
+    pred = pred.squeeze(0) if pred.dim() == 2 else pred
+    target = target.squeeze(0) if target.dim() == 2 else target
+    length = min(pred.shape[-1], target.shape[-1])
+    pred = pred[:length]
+    target = target[:length]
+    losses = []
+    for n_fft in n_ffts:
+        pred_mag = stft_mag(pred, n_fft)
+        target_mag = stft_mag(target, n_fft)
+        spectral_convergence = torch.linalg.vector_norm(pred_mag - target_mag) / (
+            torch.linalg.vector_norm(target_mag).clamp_min(1e-7))
+        log_mag = F.l1_loss(pred_mag.log(), target_mag.log())
+        losses.append(spectral_convergence + log_mag)
+    return torch.stack(losses).mean()
