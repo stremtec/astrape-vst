@@ -23,3 +23,6 @@ CLAUDE.md
 *.md
 !README.md
 !Architecture.md
+!speaker_leakage_training_direction.md
+!docs/
+!docs/*.md

@@ -17,3 +17,8 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["astrape*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.0",
+]
