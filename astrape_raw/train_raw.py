@@ -24,6 +24,7 @@ from torch.utils.data import Dataset, DataLoader
 
 warnings.filterwarnings("ignore")
 sys.path.insert(0, "external/MioCodec/src")
+sys.path.insert(0, str(Path(__file__).parent.parent))  # project root
 
 from mcs_common import (
     Batch, split_by_speaker, speaker_balanced_subset,
