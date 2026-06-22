@@ -19,6 +19,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio
 from torch.utils.data import Dataset, DataLoader
 
 warnings.filterwarnings("ignore")
@@ -254,7 +255,20 @@ def q2d2_losses(
     tgt_768 = batch.content[:, :length]
 
     voiced_boost = getattr(args, "voiced_boost", 1.0)
-    vw = _voiced_weights(batch.mel, length, voiced_boost)
+    # For waveform input, compute voiced weights from energy (not mel RMS)
+    if voiced_boost > 1.0 and batch.mel.ndim == 3 and batch.mel.shape[1] == 1:
+        # Waveform: compute energy per content frame
+        wav = batch.mel  # (B, 1, T_audio) — mel field reused for waveform
+        T_content = length
+        # Reshape to content frame resolution (~882 samples per frame at 50Hz→25Hz)
+        frame_len = 882 * 2  # 25Hz = 1764 samples
+        wav_frames = wav[:, 0, :T_content * frame_len].reshape(wav.shape[0], T_content, frame_len)
+        rms = wav_frames.pow(2).mean(dim=-1).sqrt()  # (B, T_content)
+        threshold = rms.mean(dim=1, keepdim=True).clamp(min=1e-5)
+        voiced = (rms > threshold * 0.5).float()
+        vw = 1.0 + (voiced_boost - 1.0) * voiced
+    else:
+        vw = _voiced_weights(batch.mel, length, voiced_boost)
     weighted_mask_sum = (vw * mask.float()).sum().clamp(min=1)
 
     pred_masked = pred_768.permute(0, 2, 1)[mask]
@@ -379,7 +393,6 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
-    import torchaudio
 
     # Data
     with np.load(args.data_dir / "meta.npz", allow_pickle=False) as meta:
