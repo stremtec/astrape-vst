@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 import random
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -20,13 +20,16 @@ FSQ_LEVELS = (8, 8, 8, 5, 5)
 
 @dataclass
 class Batch:
-    mel: torch.Tensor
-    content: torch.Tensor
-    tokens: torch.Tensor
-    mask: torch.Tensor
+    mel: torch.Tensor            # (B, 80, M)
+    content: torch.Tensor        # (B, L, 768)  teacher target
+    tokens: torch.Tensor         # (B, L)        integer codes
+    mask: torch.Tensor           # (B, L)        bool
     speakers: list[str]
     indices: torch.Tensor
     crop_starts: torch.Tensor
+    ssl_L0: torch.Tensor = field(default_factory=lambda: torch.empty(0))  # (B, Lx2, 768)
+    ssl_L4: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    ssl_L8: torch.Tensor = field(default_factory=lambda: torch.empty(0))
 
 
 class MioCompactDataset(Dataset):
@@ -41,12 +44,18 @@ class MioCompactDataset(Dataset):
     def __getitem__(self, item: int) -> dict:
         idx = self.indices[item]
         with np.load(self.root / f"s_{idx:05d}.npz", allow_pickle=False) as data:
+            ssl0 = data.get("ssl_L0")
+            ssl4 = data.get("ssl_L4")
+            ssl8 = data.get("ssl_L8")
             return {
                 "idx": idx,
                 "speaker": str(self.speakers[idx]),
                 "mel": torch.from_numpy(data["logmel"].astype(np.float32)),
                 "content": torch.from_numpy(data["ce_768"].astype(np.float32)),
                 "tokens": torch.from_numpy(data["ct"].astype(np.int64)),
+                "ssl_L0": torch.from_numpy(ssl0.astype(np.float32)) if ssl0 is not None else torch.empty(0,768),
+                "ssl_L4": torch.from_numpy(ssl4.astype(np.float32)) if ssl4 is not None else torch.empty(0,768),
+                "ssl_L8": torch.from_numpy(ssl8.astype(np.float32)) if ssl8 is not None else torch.empty(0,768),
             }
 
 
@@ -56,13 +65,16 @@ class ContentCollator:
         self.rng = random.Random(seed)
         self.pad_mel_multiple = pad_mel_multiple
 
-    def _crop(self, sample: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    def _crop(self, sample: dict) -> tuple:
         mel = sample["mel"]
         content = sample["content"]
         tokens = sample["tokens"]
+        ssl0 = sample.get("ssl_L0", torch.empty(0,768))
+        ssl4 = sample.get("ssl_L4", torch.empty(0,768))
+        ssl8 = sample.get("ssl_L8", torch.empty(0,768))
         idx = int(sample["idx"])
         if self.mel_frames is None or mel.shape[1] <= self.mel_frames:
-            return mel, content, tokens, 0, idx
+            return mel, content, tokens, ssl0, ssl4, ssl8, 0, idx
 
         max_start = mel.shape[1] - self.mel_frames
         start = self.rng.randint(0, max_start)
@@ -70,24 +82,31 @@ class ContentCollator:
         mel = mel[:, start : start + self.mel_frames]
         token_start = start // 2
         token_len = math.ceil(mel.shape[1] / 2)
+        ssl_start = token_start * 2
+        ssl_len = token_len * 2
         return (
             mel,
             content[token_start : token_start + token_len],
             tokens[token_start : token_start + token_len],
+            ssl0[ssl_start : ssl_start + ssl_len] if ssl0.numel()>0 else ssl0,
+            ssl4[ssl_start : ssl_start + ssl_len] if ssl4.numel()>0 else ssl4,
+            ssl8[ssl_start : ssl_start + ssl_len] if ssl8.numel()>0 else ssl8,
             start,
             idx,
         )
 
     def __call__(self, samples: list[dict]) -> Batch:
         cropped = [self._crop(sample) for sample in samples]
-        max_mel = max(mel.shape[1] for mel, _, _, _, _ in cropped)
+        max_mel = max(mel.shape[1] for mel, _, _, _, _, _, _, _ in cropped)
         if self.pad_mel_multiple > 1:
             max_mel = ((max_mel + self.pad_mel_multiple - 1) // self.pad_mel_multiple) * self.pad_mel_multiple
-        max_tokens = max(tokens.shape[0] for _, _, tokens, _, _ in cropped)
+        max_tokens = max(tokens.shape[0] for _, _, tokens, _, _, _, _, _ in cropped)
+        max_ssl = max_tokens * 2
 
         mels, contents, tokens_out, masks = [], [], [], []
+        ssl0s, ssl4s, ssl8s = [], [], []
         crop_starts, indices = [], []
-        for mel, content, tokens, crop_start, idx in cropped:
+        for mel, content, tokens, ssl0, ssl4, ssl8, crop_start, idx in cropped:
             token_len = min(tokens.shape[0], content.shape[0])
             mels.append(F.pad(mel, (0, max_mel - mel.shape[1])))
             contents.append(F.pad(content[:token_len], (0, 0, 0, max_tokens - token_len)))
@@ -95,6 +114,16 @@ class ContentCollator:
             mask = torch.zeros(max_tokens, dtype=torch.bool)
             mask[:token_len] = True
             masks.append(mask)
+            # SSL features: pad to max_ssl
+            if ssl0.numel() > 0:
+                sl = min(ssl0.shape[0], max_ssl)
+                ssl0s.append(F.pad(ssl0[:sl], (0,0,0,max_ssl-sl)))
+                ssl4s.append(F.pad(ssl4[:sl], (0,0,0,max_ssl-sl)))
+                ssl8s.append(F.pad(ssl8[:sl], (0,0,0,max_ssl-sl)))
+            else:
+                ssl0s.append(torch.zeros(max_ssl, 768))
+                ssl4s.append(torch.zeros(max_ssl, 768))
+                ssl8s.append(torch.zeros(max_ssl, 768))
             crop_starts.append(crop_start)
             indices.append(idx)
 
@@ -103,6 +132,9 @@ class ContentCollator:
             content=torch.stack(contents),
             tokens=torch.stack(tokens_out),
             mask=torch.stack(masks),
+            ssl_L0=torch.stack(ssl0s),
+            ssl_L4=torch.stack(ssl4s),
+            ssl_L8=torch.stack(ssl8s),
             speakers=[sample["speaker"] for sample in samples],
             indices=torch.tensor(indices, dtype=torch.long),
             crop_starts=torch.tensor(crop_starts, dtype=torch.long),
@@ -168,6 +200,29 @@ class ResidualConvBlock(nn.Module):
         residual = x
         h = self.norm(x.transpose(1, 2)).transpose(1, 2)
         h = F.silu(self.conv(h))
+        return residual + F.dropout(h, self.dropout, self.training)
+
+
+
+class DepthwiseResidualBlock(nn.Module):
+    """Causal depthwise separable conv block (WavTokenizer/ConvNeXt style).
+
+    LayerNorm → DepthwiseConv1d(groups=dim) → SiLU → PointwiseConv1d → residual.
+    Much more parameter-efficient than standard conv, enabling deeper stems.
+    """
+    def __init__(self, dim: int, kernel: int, dilation: int, dropout: float):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.depthwise = CausalConv1d(dim, dim, kernel, dilation=dilation, groups=dim)
+        self.pointwise = nn.Conv1d(dim, dim, kernel_size=1)
+        self.dropout = dropout
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        h = self.norm(x.transpose(1, 2)).transpose(1, 2)
+        h = self.depthwise(h)
+        h = F.silu(h)
+        h = self.pointwise(h)
         return residual + F.dropout(h, self.dropout, self.training)
 
 

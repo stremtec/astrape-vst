@@ -193,7 +193,9 @@ class Q2D2Quantizer(nn.Module):
         levels: List[int],
         vq_type: str = "rhombic",
         noise_dropout: float = 0.0,
+        gumbel_temperature: float = 0.0,
         projection_bias: bool = True,
+        use_l2_norm: bool = False,
     ):
         super().__init__()
         
@@ -206,6 +208,8 @@ class Q2D2Quantizer(nn.Module):
         self.num_pairs = codebook_dim // 2
         self.vq_type = vq_type
         self.noise_dropout = noise_dropout
+        self.gumbel_temperature = gumbel_temperature
+        self.use_l2_norm = use_l2_norm
         
         # ── learnable projections ──
         self.project_in = nn.Sequential(
@@ -314,11 +318,26 @@ class Q2D2Quantizer(nn.Module):
             p = z_flat[:, i]                         # (B*T, 2)
             
             # pairwise distances: (B*T, 1) vs (1, G_i) → (B*T, G_i)
-            dists = torch.cdist(p.unsqueeze(1), g.unsqueeze(0)).squeeze(1)
-            n_idx = dists.argmin(dim=-1)            # (B*T,)
-            
-            snapped.append(g[n_idx])                # (B*T, 2)
-            nearest_all.append(n_idx)               # (B*T,)
+            if self.use_l2_norm:
+                p = F.normalize(p, p=2, dim=-1)
+                gn = F.normalize(g, p=2, dim=-1)
+                dists = torch.cdist(p.unsqueeze(1), gn.unsqueeze(0)).squeeze(1)
+            else:
+                dists = torch.cdist(p.unsqueeze(1), g.unsqueeze(0)).squeeze(1)
+
+            # ── Gumbel-Softmax soft assignment (prefill / exploration) ──
+            if self.training and self.gumbel_temperature > 0:
+                soft_w = F.gumbel_softmax(-dists, tau=self.gumbel_temperature,
+                                          hard=False, dim=-1)        # (B*T, G_i)
+                snapped_i = soft_w @ g                                # (B*T, 2)
+                n_idx = (-dists).argmax(dim=-1)                        # for util stats
+            else:
+                # ── hard argmin (original) ──
+                n_idx = dists.argmin(dim=-1)
+                snapped_i = g[n_idx]                                  # (B*T, 2)
+
+            snapped.append(snapped_i)
+            nearest_all.append(n_idx)
         
         snapped = torch.stack(snapped, dim=1)       # (B*T, P, 2)
         nearest = torch.stack(nearest_all, dim=1)   # (B*T, P)
@@ -358,11 +377,15 @@ class Q2D2Quantizer(nn.Module):
             z_snapped = torch.where(mask, z_snapped + offset, z_snapped)
         
         bounded_q = z_snapped.reshape_as(bounded)  # (B, T, d)
-        
-        # STE: pass gradients through quantization
-        # De-normalize by half-widths
+
+        # De-normalize by half-widths.
+        # Gumbel-Softmax: bounded_q is already differentiable, skip STE.
+        # Hard snap: use STE to pass gradients through the argmin.
         half_l = (self._levels // 2).float()
-        z_codes = ste(z, bounded_q) / half_l  # back to [-1, 1] scale
+        if self.training and self.gumbel_temperature > 0:
+            z_codes = bounded_q / half_l    # differentiable, no STE
+        else:
+            z_codes = ste(z, bounded_q) / half_l   # STE for hard snap
         
         return z_codes, nearest
     
@@ -465,6 +488,8 @@ class Q2D2Projection(nn.Module):
         levels: List[int] | None = None,
         vq_type: str = "rhombic",
         noise_dropout: float = 0.0,
+        gumbel_temperature: float = 0.0,
+        use_l2_norm: bool = False,
     ):
         super().__init__()
         
@@ -483,6 +508,8 @@ class Q2D2Projection(nn.Module):
             levels=levels,
             vq_type=vq_type,
             noise_dropout=noise_dropout,
+            gumbel_temperature=gumbel_temperature,
+            use_l2_norm=use_l2_norm,
         )
         self.proj_out = nn.Linear(q2d2_dim, content_dim)
         

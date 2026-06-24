@@ -37,7 +37,7 @@ from mcs_common import (
     Batch, MioCompactDataset, ContentCollator,
     split_by_speaker, speaker_balanced_subset,
     move_batch, save_checkpoint,
-    CausalConv1d, ResidualConvBlock, CellDownsample,
+    CausalConv1d, ResidualConvBlock, DepthwiseResidualBlock, CellDownsample,
     DEFAULT_DATA_DIR, DEFAULT_PROJECTION,
     _voiced_weights,
 )
@@ -61,7 +61,10 @@ class MCSTransQ2D2Config:
     ffn_dim: int = 1024
     window: int = 256
     conv_kernel: int = 5
-    stem_dilations: tuple[int, ...] = (1, 2, 4, 8)
+    stem_dilations: tuple[int, ...] = (1, 2, 3, 4, 6, 8, 12, 16)
+    stem_block_type: str = "depthwise"  # "standard" | "depthwise"
+    q2d2_noise_dropout: float = 0.0  # exploration noise for Q2D2
+    q2d2_l2_norm: bool = False  # L2-normalize features before grid snapping
     skip_dilations: tuple[int, ...] = (16, 32)
     dropout: float = 0.0
     # Transformer improvements
@@ -75,6 +78,7 @@ class MCSTransQ2D2Config:
     # GRL speaker disentanglement
     grl_weight: float = 0.0          # 0 = disabled, ~0.1 is a good start
     grl_num_speakers: int = 0        # set automatically from dataset
+    use_wavlm_frontend: bool = False  # use WavLM CNN instead of Mel
 
 
 # ─────────────────────────────────────────────
@@ -294,10 +298,11 @@ class MCSTransQ2D2(nn.Module):
         self.config = config
         dim = config.conv_dim
 
-        # ── conv frontend (unchanged) ──
+        # ── conv frontend (depthwise-separable for deeper receptive field) ──
+        Block = DepthwiseResidualBlock if config.stem_block_type == "depthwise" else ResidualConvBlock
         self.input_conv = CausalConv1d(config.in_dim, dim, config.conv_kernel)
         self.blocks = nn.ModuleList([
-            ResidualConvBlock(dim, config.conv_kernel, d, config.dropout)
+            Block(dim, config.conv_kernel, d, config.dropout)
             for d in config.stem_dilations
         ])
         self.skips = nn.ModuleList([
@@ -335,7 +340,16 @@ class MCSTransQ2D2(nn.Module):
             content_dim=config.content_dim,
             levels=list(config.q2d2_levels),
             vq_type=config.q2d2_grid,
+            noise_dropout=config.q2d2_noise_dropout,
+            use_l2_norm=config.q2d2_l2_norm,
         )
+
+        # ── optional WavLM frontend adapter ──
+        self.wavlm_adapter = None
+
+        # ── forecast heads: predict teacher[t+1], teacher[t+2] ──
+        self.forecast_head_1 = nn.Linear(config.trans_dim, config.content_dim)
+        self.forecast_head_2 = nn.Linear(config.trans_dim, config.content_dim)
 
         # ── optional GRL speaker classifier ──
         self.speaker_classifier: SpeakerClassifier | None = None
@@ -371,10 +385,16 @@ class MCSTransQ2D2(nn.Module):
         # content:  (B, T, 768)  — MioCodec compatible
         # q2d2_codes: (B, T, 6) — raw quantized latent (for utilization stats)
 
+        # ── forecast predictions ──
+        fc1 = self.forecast_head_1(h)  # (B, T, 768)
+        fc2 = self.forecast_head_2(h)
+
         return {
             "projected": content.transpose(1, 2),   # (B, 768, T)
             "q2d2_codes": q2d2_codes,                # (B, T, 6)
-            "ordinal": None,                          # no ordinal heads in Q2D2
+            "ordinal": None,
+            "forecast_1": fc1.transpose(1, 2),        # (B, 768, T)
+            "forecast_2": fc2.transpose(1, 2),
         }
 
 
@@ -389,6 +409,7 @@ def q2d2_losses(
     quantizer: Q2D2Quantizer | None = None,
     speaker_classifier: nn.Module | None = None,
     speaker_ids: torch.Tensor | None = None,
+    time_shift: int = 0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute losses for Q2D2 quantized output.
 
@@ -409,12 +430,20 @@ def q2d2_losses(
     projected = output["projected"]                     # (B, 768, T)
     q2d2_codes = output.get("q2d2_codes")               # (B, T, 6) or None
 
-    length = min(projected.shape[2], batch.content.shape[1],
-                 batch.mask.shape[1])
-    mask = batch.mask[:, :length]
+    ts = time_shift
+    length = min(projected.shape[2] - ts, batch.content.shape[1] - ts,
+                 batch.mask.shape[1] - ts)
+    if length < 2:
+        return projected.sum() * 0.0, {"cos768": 0.0}
+    mask = batch.mask[:, ts:ts + length]
 
-    pred_768 = projected[:, :, :length]                  # (B, 768, L)
-    tgt_768 = batch.content[:, :length]                  # (B, L, 768)
+    # ── time-shifted alignment ──
+    # student[t] compares with teacher[t-ts]
+    pred_768 = projected[:, :, ts:ts + length]           # (B, 768, L)
+    if ts > 0:
+        tgt_768 = batch.content[:, :length]               # student[ts..] ↔ teacher[0..]
+    else:
+        tgt_768 = batch.content[:, :length]               # (B, L, 768)
 
     # voiced weighting
     voiced_boost = getattr(args, "voiced_boost", 1.0)
@@ -450,6 +479,24 @@ def q2d2_losses(
             args.content_l1_weight * content_l1 +
             args.delta_weight * delta)
 
+    # ── forecast loss ──
+    forecast_weight = getattr(args, "forecast_weight", 0.0)
+    forecast_loss_val: float = 0.0
+    if forecast_weight > 0:
+        fc1 = output.get("forecast_1")
+        fc2 = output.get("forecast_2")
+        if fc1 is not None and fc2 is not None and length >= 3:
+            fc1_flat = fc1[:, :, ts:ts + length].permute(0, 2, 1)
+            fc2_flat = fc2[:, :, ts:ts + length].permute(0, 2, 1)
+            Lf = min(length, batch.content.shape[1] - 2)
+            tgt_fc1 = batch.content[:, 1:1 + Lf]
+            tgt_fc2 = batch.content[:, 2:2 + Lf]
+            fl1 = F.mse_loss(fc1_flat[:, :Lf, :], tgt_fc1, reduction="mean")
+            fl2 = F.mse_loss(fc2_flat[:, :Lf, :], tgt_fc2, reduction="mean")
+            fl = (fl1 + fl2) * 0.5
+            forecast_loss_val = float(fl.detach().cpu())
+            loss = loss + forecast_weight * fl
+
     # ── GRL speaker disentanglement loss ──
     grl_loss_val: float = 0.0
     grl_acc_val: float = 0.0
@@ -475,6 +522,7 @@ def q2d2_losses(
         "delta": float(delta.detach().cpu()),
         "grl_loss": grl_loss_val,
         "grl_acc": grl_acc_val,
+        "forecast_loss": forecast_loss_val,
     }
 
     # Q2D2 utilization stats (diagnostic, no gradient)
@@ -520,7 +568,8 @@ def evaluate(
             )
         output = model(batch.mel, padding_mask=batch.mask)
         _, metrics = q2d2_losses(output, batch, args, quantizer,
-                                 model.speaker_classifier, speaker_ids)
+                                 model.speaker_classifier, speaker_ids,
+                                 time_shift=args.time_shift)
         for key, value in metrics.items():
             buckets.setdefault(key, []).append(value)
     model.train()
@@ -611,6 +660,19 @@ def parse_args() -> argparse.Namespace:
     # GRL speaker disentanglement
     p.add_argument("--grl-weight", type=float, default=0.0,
                    help="GRL speaker disentanglement weight (0=disabled, ~0.1).")
+    p.add_argument("--grl-num-speakers", type=int, default=0,
+                   help="Number of speakers for GRL classifier (auto if 0).")
+    p.add_argument("--time-shift", type=int, default=0,
+                   help="Shift teacher target by Δ frames. 1 frame = 40ms.")
+    p.add_argument("--forecast-weight", type=float, default=0.0,
+                   help="Weight on forecast heads.")
+    p.add_argument("--stem-block-type", default="depthwise",
+                   choices=["standard","depthwise"],
+                   help="Conv stem block type.")
+    p.add_argument("--center-false", action="store_true",
+                   help="Compute center=False mel on-the-fly from raw audio.")
+    p.add_argument("--voiced-boost", type=float, default=1.0,
+                   help="Voiced frame weight multiplier.")
 
     # Decoder-in-loop (original audio feedback)
     p.add_argument("--decoder-wave-weight", type=float, default=0.0,
@@ -654,6 +716,12 @@ def main() -> None:
     train_idx, val_idx = split_by_speaker(speakers, args.val_fraction, args.seed)
     probe_idx = speaker_balanced_subset(val_idx, speakers, args.probe_samples, args.seed)
 
+    if args.center_false:
+        from eval_mcs_trans_audio import SAMPLE_RATE
+        train_ds = CenterFalseMelWrapper(train_ds, source_files)
+        probe_ds = CenterFalseMelWrapper(probe_ds, source_files)
+        print("center=False mel: computing on-the-fly from raw audio", flush=True)
+
     train_loader = DataLoader(
         MioCompactDataset(args.data_dir, train_idx, speakers),
         batch_size=args.batch_size, shuffle=True,
@@ -682,7 +750,8 @@ def main() -> None:
         q2d2_levels=args.q2d2_levels,
         q2d2_grid=args.q2d2_grid,
         grl_weight=args.grl_weight,
-        grl_num_speakers=len(unique_speakers),
+        grl_num_speakers=args.grl_num_speakers if args.grl_num_speakers > 0 else len(unique_speakers),
+        stem_block_type=args.stem_block_type,
     )
 
     # ── model ──
@@ -750,7 +819,9 @@ def main() -> None:
         print(f"Initialized conv+transformer from {checkpoint_path}", flush=True)
 
     elif checkpoint is not None and checkpoint_mode == "resume":
-        model.load_state_dict(checkpoint["state_dict"], strict=True)
+        missing, unexpected = model.load_state_dict(checkpoint["state_dict"], strict=False)
+        if missing:
+            print(f"Missing keys: {len(missing)}", flush=True)
         start_epoch = int(checkpoint.get("epoch", -1)) + 1
         global_step = int(checkpoint.get("metrics", {}).get("global_step", 0))
         current_cos = float(checkpoint.get("metrics", {}).get("probe", {}).get("cos768", -1.0))
@@ -769,7 +840,10 @@ def main() -> None:
 
     if checkpoint is not None and checkpoint_mode == "resume":
         if "optimizer" in checkpoint:
-            optimizer.load_state_dict(checkpoint["optimizer"])
+            try:
+                optimizer.load_state_dict(checkpoint["optimizer"])
+            except ValueError:
+                print("Optimizer mismatch, starting fresh")
         if "scheduler" in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler"])
 
@@ -843,7 +917,8 @@ def main() -> None:
 
             output = model(batch.mel, padding_mask=batch.mask)
             loss, metrics = q2d2_losses(output, batch, args, quantizer,
-                                        model.speaker_classifier, speaker_ids)
+                                        model.speaker_classifier, speaker_ids,
+                                        time_shift=args.time_shift)
 
             # Decoder-in-loop: MR-STFT vs original wav
             if (mio is not None and
