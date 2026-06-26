@@ -27,3 +27,10 @@ CLAUDE.md
 !docs/
 !docs/*.md
 data
+
+# docs
+*.md
+!README.md
+!ARCHITECTURE.md
+!cdecoder.md
+wavlm_16k_local/
