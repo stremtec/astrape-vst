@@ -1,4 +1,4 @@
-# Astrape-vc — Strict-Causal Zero-Shot Voice Conversion
+# Astrape-vc — Zero-Shot Voice Conversion
 
 Zero-lookahead neural voice conversion at 44.1kHz.  
 **Current best: cos768 = 0.934** (strict-causal, 16kHz WavLM + 7L Transformer).
