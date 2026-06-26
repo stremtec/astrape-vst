@@ -81,27 +81,66 @@ from astrape.voicebank import VoiceBank
 ## Project Structure
 
 ```
-train_mcs_q2d2.py        ★ Main training (Q2D2 + RoPE + SwiGLU + GRL + WavLM)
-mcs_common.py             CausalConv1d, DepthwiseResidualBlock, dataset
-mcs_q2d2.py               Q2D2 quantizer (ICML 2026)
-cf_finetune.py             Center=False adaptation
-astrape_vc.py              Streaming VC evaluation
-check_cache.py             Cache integrity checker
+train_mcs_q2d2.py         ★ Encoder training (Q2D2 + RoPE + SwiGLU + GRL + WavLM)
+train_decoder.py           ★ Decoder Phase 0 training (MR-STFT + Mel L1)
+mcs_common.py              CausalConv1d, DepthwiseResidualBlock, dataset, MR-STFT loss
+mcs_q2d2.py                Q2D2 quantizer (ICML 2026)
 cache_wavlm_16k.py         16kHz WavLM CNN cache extraction
-eval_mcs_trans_audio.py    VC evaluation
-ARCHITECTURE.md            Full architecture diagram
-tests/                     Test scripts
+cache_wavlm_cnn.py          44.1kHz WavLM CNN cache (legacy)
+check_cache.py              Cache integrity checker
+eval_q2d2_vc.py             VC evaluation
+eval_mcs_trans_audio.py     MioCodec bridge utilities
+astrape/                    Core library
+  causal_decoder.py           Decoder v4 (7.08M, 31.9ms, Conv / Mamba)
+  mamba_block.py              Mamba SSM block (experimental, CPU-only)
+  encoder.py                  Causal Content Encoder
+  fsq.py, data.py, audio.py   Supporting modules
+  voicebank.py                VoiceBank management
+  wave_decoder.py             CausalConv1d base
+tests/                      Test scripts
+  test_streaming_invariant.py  Streaming causality tests
 
 data/mio_vctk_full_compact/   VCTK dataset (npz cache)
 data/mio_vctk_full_compact/wavlm_16k/   16kHz WavLM CNN cache (14GB)
+wavlm_16k_local/              Local copy of WavLM cache (for training stability)
 checkpoints/ → /Volumes/UNTITLED/btrv5_checkpoints/
 ```
 
+## Decoder v4
+
+Ultra-lightweight streaming vocoder. Speaker conditioning via AdaLN-Zero.
+STFT-domain teacher forcing with Gaussian-blurred targets (cdecoder.md).
+
+```bash
+# Phase 0: Train decoder with frozen encoder
+.venv/bin/python train_decoder.py \
+  --device mps --epochs 30 --steps-per-epoch 2000 --batch-size 2 --max-frames 50 \
+  --lr 2e-5 --mrstft-weight 0.3 --mel-l1-weight 1.0 \
+  --blur-sigma-ms 2.0 --nffts 512 1024 2048
+
+# With Mamba SSM (CPU only, experimental)
+.venv/bin/python train_decoder.py --use-mamba --device cpu --max-frames 25 ...
+```
+
+| Component | Params | Delay |
+|-----------|--------|-------|
+| Encoder (7L WavLM) | 22.4M | 27ms |
+| Decoder (Conv) | 7.08M | 31.9ms |
+| Decoder (Mamba) | 8.70M | 20.3ms |
+| **E2E (Conv)** | **29.4M** | **58.9ms** |
+| **E2E (Mamba)** | **31.1M** | **47.3ms** |
+
 ## References
 
-- **Q2D2**: Shuster & Nachmani, "Two-Dimensional Quantization for Geometry-Aware Audio Coding", ICML 2026
+- **Q2D2**: Shuster & Nachmani, "Two-Dimensional Quantization for Geometry-Aware Audio Coding", ICML 2026, arXiv:2512.01537
+- **Mamba**: Gu & Dao, "Mamba: Linear-Time Sequence Modeling with Selective State Spaces", 2023, arXiv:2312.00752
+- **Hyena**: Poli et al., "Hyena Hierarchy: Towards Larger Convolutional Language Models", 2023, arXiv:2302.10866
 - **MioCodec**: Aratako/MioCodec-25Hz-44.1kHz-v2 (HuggingFace)
-- **WavLM**: Chen et al., 2022
-- **GRL**: Ganin & Lempitsky, ICML 2015
-- **ConvNeXt**: Liu et al., CVPR 2022
-- **WavTokenizer**: Ji et al., 2024
+- **WavLM**: Chen et al., "WavLM: Large-Scale Self-Supervised Pre-Training for Full Stack Speech Processing", 2022
+- **GRL**: Ganin & Lempitsky, "Unsupervised Domain Adaptation by Backpropagation", ICML 2015
+- **ConvNeXt**: Liu et al., "A ConvNet for the 2020s", CVPR 2022
+- **WavTokenizer**: Ji et al., "WavTokenizer: an Efficient Acoustic Discrete Codec Tokenizer", 2024
+- **Snake/BigVGAN**: Lee et al., "BigVGAN: A Universal Neural Vocoder", 2023, arXiv:2206.02944
+- **ISTFT/Vocos**: Siuzdak et al., "Vocos: Closing the Gap Between Time-Domain and Fourier-Based Neural Vocoders", 2024, arXiv:2306.00819
+- **Predictive Coding**: Oord et al., "Representation Learning with Contrastive Predictive Coding", 2018
+- **APCodec**: Ai et al., "APCodec: A Neural Audio Codec", IEEE/ACM TASLP 2024, arXiv:2402.10533
