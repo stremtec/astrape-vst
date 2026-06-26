@@ -6,15 +6,15 @@ Zero-lookahead neural voice conversion at 44.1kHz.
 ## Architecture
 
 ```
-Mic 44.1kHz → resample(44.1k→16k) → WavLM CNN L0-L4 (94M frozen, 25ms) → 50Hz
-  → Adapter(512→80, 87K) → Causal Depthwise Stem (1.4M, 8 blocks)
+Mic 44.1kHz → resample(44.1k→16k) → WavLM CNN L0-L4 (94M frozen, 10ms) → 200Hz
+  → StridingAdapter(200→50Hz, 5ms, 87K) → Causal Depthwise Stem (1.4M, 8 blocks)
   → Downsample(2×) → 25Hz → ProjIn(320→512)
   → Causal Transformer 8L (15.8M, RoPE+SwiGLU, window=256)
   → Q2D2 (3M codes, Rhombic[9×9]³) → content 768d @ 25Hz
   → Decoder v4 (7.08M, causal streaming) → wav 44.1kHz
 ```
 
-**Learnable: 24.3M | Frozen: 94.4M | Total algorithmic latency: ~27ms (encoder) + ~32ms (decoder) = ~59ms**
+**Learnable: 24.3M | Frozen: 94.4M | Total algorithmic latency: ~17ms (encoder) + ~32ms (decoder) = ~49ms**
 
 ## Key Features
 
@@ -124,11 +124,11 @@ STFT-domain teacher forcing with Gaussian-blurred targets (cdecoder.md).
 
 | Component | Params | Delay |
 |-----------|--------|-------|
-| Encoder (8L WavLM L4) | 24.3M | 27ms |
+| Encoder (8L WavLM L4) | 24.3M | 17ms |
 | Decoder (Conv) | 7.08M | 31.7ms |
 | Decoder (Mamba) | 8.70M | 20.1ms |
-| **E2E (Conv)** | **31.4M** | **58.7ms** |
-| **E2E (Mamba)** | **33.0M** | **47.1ms** |
+| **E2E (Conv)** | **31.4M** | **48.7ms** |
+| **E2E (Mamba)** | **33.0M** | **37.1ms** |
 
 ## References
 
