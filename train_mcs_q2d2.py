@@ -93,6 +93,7 @@ class MCSTransQ2D2Config:
     q2d2_gumbel_end: float = 0.0
     # WavLM frontend adapter dims
     wavlm_in_dim: int = 512
+    wavlm_rate: int = 50      # Hz (50=default, 200=L4 raw)
 
 
 # ─────────────────────────────────────────────
@@ -386,26 +387,42 @@ class MambaBlock(nn.Module):
 # ─────────────────────────────────────────────
 
 class WavLMFrontendAdapter(nn.Module):
-    """Projects cached WavLM CNN features (512d @ ~46Hz) to mel-like 80d.
+    """Projects cached WavLM CNN features (512d) to mel-like 80d.
 
-    The cache (cache_wavlm_cnn.py) stores 'wavlm_cnn' as (T, 512) float32,
-    produced by MioCodec's WavLM feature_extractor → avg_pool(k=3, s=3).
-    This adapter makes that feature usable as the encoder input in place of
-    the 80-dim log-mel.
+    Supports rate conversion via stride: when wavlm_rate > 50Hz,
+    uses CausalConv1d(s=rate/50) for learned, low-delay downsampling.
+
+    Args:
+        in_dim: input feature dim (512 for WavLM)
+        out_dim: output dim (80 for mel-compatible)
+        wavlm_rate: input rate in Hz (50 default, 200 for L4 raw)
+        dropout: dropout rate
     """
-
     def __init__(self, in_dim: int = 512, out_dim: int = 80,
-                 hidden: int = 256, dropout: float = 0.0):
+                 hidden: int = 256, wavlm_rate: int = 50,
+                 dropout: float = 0.0):
         super().__init__()
+        self.wavlm_rate = wavlm_rate
+        stride = max(1, wavlm_rate // 50)  # e.g., 200//50 = 4
+
+        if stride > 1:
+            # Learned stride-down: CausalConv + projection
+            self.down = CausalConv1d(in_dim, in_dim//2, kernel_size=2,
+                                     stride=stride, groups=in_dim//2)
+        else:
+            self.down = nn.Identity()
+
         self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden),
+            nn.Linear(in_dim if stride==1 else in_dim//2, hidden),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, out_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, 512) → (B, T, 80)
+        # x: (B, T_input, in_dim)
+        if self.wavlm_rate > 50:
+            x = self.down(x.transpose(1, 2)).transpose(1, 2)  # conv
         return self.net(x)
 
 
@@ -493,7 +510,7 @@ class MCSTransQ2D2(nn.Module):
         if self.use_wavlm_frontend:
             self.wavlm_adapter: nn.Module | None = WavLMFrontendAdapter(
                 in_dim=config.wavlm_in_dim, out_dim=config.in_dim,
-                dropout=config.dropout,
+                wavlm_rate=config.wavlm_rate, dropout=config.dropout,
             )
         else:
             self.wavlm_adapter = None
@@ -1060,6 +1077,8 @@ def parse_args() -> argparse.Namespace:
                    help="Use cached WavLM CNN features instead of mel.")
     p.add_argument("--wavlm-dir", default="wavlm_16k",
                    help="Subdirectory for WavLM cache (default: wavlm_16k, use wavlm_L4 for L4)")
+    p.add_argument("--wavlm-rate", type=int, default=50,
+                   help="WavLM feature rate in Hz (50=default, 200=L4 raw)")
 
     return p.parse_args()
 
@@ -1143,6 +1162,7 @@ def main() -> None:
         grl_num_speakers=args.grl_num_speakers if args.grl_num_speakers > 0 else len(unique_speakers),
         stem_block_type=args.stem_block_type,
         use_wavlm_frontend=args.wavlm_frontend,
+        wavlm_rate=args.wavlm_rate,
         delta2_weight=args.delta2_weight,
         contrastive_weight=args.contrastive_weight,
         contrastive_tau=args.contrastive_tau,
