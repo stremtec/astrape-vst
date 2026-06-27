@@ -44,10 +44,11 @@ S = 44100
 def mrstft(pred: torch.Tensor, tgt: torch.Tensor, nffts) -> torch.Tensor:
     """Batched multi-resolution STFT loss, computed on the input's device.
 
-    torch.stft works correctly on MPS in this torch build (verified: forward
-    matches CPU to ~4e-5, backward gives finite grads), so this runs ON-DEVICE
-    and BATCHED — no per-sample Python loop or MPS↔CPU transfer/sync that the old
-    CPU path needed. Numerically identical objective; works on CPU too.
+    NOTE: call this with CPU tensors. torch.stft's BACKWARD on MPS intermittently
+    emits non-finite gradients (the forward matches CPU to ~4e-5, but the backward
+    does NOT) — this destabilised decoder training (accelerating skipped steps /
+    recon→nan), so the caller moves pred/tgt to CPU. Device-agnostic and batched;
+    correct on CPU.
     """
     loss = pred.new_zeros(())
     for n_fft in nffts:
@@ -174,9 +175,12 @@ def main():
         if "sch_d" in ck: sch_d.load_state_dict(ck["sch_d"])
         start_epoch = int(ck.get("epoch", -1)) + 1
 
+    # CPU: the spectral reconstruction loss is computed on CPU (MPS torch.stft's
+    # backward intermittently emits non-finite grads — see the recon block), so its
+    # mel transform lives on CPU too.
     mel_fn = torchaudio.transforms.MelSpectrogram(
         sample_rate=S, n_fft=2048, hop_length=512, n_mels=80, f_min=0, f_max=S / 2, power=1,
-    ).to(device)
+    )
 
     dec_params = sum(p.numel() for p in decoder.parameters())
     print(f"Decoder v5: {dec_params/1e6:.2f}M  (n_fft={dec_cfg.n_fft}, nsf={dec_cfg.use_nsf}, "
@@ -207,10 +211,17 @@ def main():
             pred, tgt = pred[:, :t_len], audio[:, :t_len]
             tgt_blur = gaussian_blur_wave(tgt, args.blur_sigma_ms) if args.blur_sigma_ms > 0 else tgt
 
-            # ── reconstruction (always) — full audio, on-device batched MR-STFT ──
-            recon = args.mrstft_weight * mrstft(pred, tgt_blur, args.nffts)
-            recon = recon + args.mel_l1_weight * F.l1_loss(
-                mel_fn(pred).clamp_min(1e-5).log(), mel_fn(tgt_blur).clamp_min(1e-5).log())
+            # ── reconstruction (always) — spectral loss computed on CPU ──
+            # MPS torch.stft's BACKWARD intermittently emits non-finite gradients,
+            # which (pre-guard) poisoned the weights → recon=nan, and (post-guard)
+            # showed up as accelerating skipped steps. CPU stft is exact; autograd
+            # flows the grads back to the MPS decoder. The decoder fwd/iSTFT stays on
+            # MPS (verified always finite). Per-step transfer is ~0.7MB → negligible.
+            pred_c, tgt_c = pred.float().cpu(), tgt_blur.float().cpu()
+            recon = (args.mrstft_weight * mrstft(pred_c, tgt_c, args.nffts)
+                     + args.mel_l1_weight * F.l1_loss(
+                         mel_fn(pred_c).clamp_min(1e-5).log(),
+                         mel_fn(tgt_c).clamp_min(1e-5).log())).to(device)
 
             if adversarial:
                 # Discriminate on a random short window (HiFi-GAN segment style):
