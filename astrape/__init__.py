@@ -1,15 +1,6 @@
 """Core infrastructure for Astrape VC."""
 
-from .causal_decoder import CausalDecoder, CausalDecoderConfig
-from .encoder import CausalContentEncoder, ContentEncoderState, ContentOutput, EncoderConfig
+from .decoder import CausalDecoderV5, CausalDecoderV5Config
 from .voicebank import VoiceBank
 
-__all__ = [
-    "CausalContentEncoder",
-    "CausalDecoder",
-    "CausalDecoderConfig",
-    "ContentEncoderState",
-    "ContentOutput",
-    "EncoderConfig",
-    "VoiceBank",
-]
+__all__ = ["CausalDecoderV5", "CausalDecoderV5Config", "VoiceBank"]

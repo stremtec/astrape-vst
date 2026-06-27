@@ -38,11 +38,16 @@ def check_npz(data_dir, repair=False, srcs=None, meta=None):
     
     return broken, missing_keys
 
-def check_wavlm(data_dir, repair=False, srcs=None, meta=None):
-    """Check all wavlm_cnn/s_XXXXX.npy files."""
-    wavlm_dir = data_dir / 'wavlm_cnn'
+def check_wavlm(data_dir, repair=False, srcs=None, meta=None, subdir='wavlm_L4_200hz'):
+    """Check all <subdir>/s_XXXXX.npy WavLM cache files.
+
+    The integrity check (exists / loads / 2-D / 512-channel / not truncated) is
+    rate-agnostic, so it covers any of wavlm_16k, wavlm_L4, wavlm_L4_200hz.
+    Pass --wavlm-dir to point it at the cache the encoder actually trains on.
+    """
+    wavlm_dir = Path(subdir) if Path(subdir).is_absolute() else data_dir / subdir
     if not wavlm_dir.exists():
-        return [(0, 'wavlm_cnn directory missing')], []
+        return [(0, f'{subdir} directory missing')], []
     n = int(meta['n_samples']) if meta else 43885
     broken, missing = [], []
     
@@ -65,42 +70,56 @@ def check_wavlm(data_dir, repair=False, srcs=None, meta=None):
     
     return broken, missing
 
-def repair_files(broken, missing, data_dir, srcs):
-    """Auto-repair broken WavLM CNN cache files."""
+def repair_files(broken, missing, data_dir, srcs, subdir='wavlm_L4_200hz'):
+    """Auto-repair broken WavLM cache files (L4 raw 200Hz recipe).
+
+    Regenerates with the SAME extraction as cache_wavlm_L4_raw.py — resample to
+    16kHz, run the first 5 conv layers (L4, 200Hz), save (T, 512).  This matches
+    the wavlm_L4_200hz cache the StridingAdapter encoder consumes (the previous
+    recipe fed 44.1kHz audio through the full CNN + 3× avg-pool, which is wrong
+    for every current cache).
+    """
     if not (broken or missing):
         return
     print(f'\nRepairing {len(broken)} broken + {len(missing)} missing files...')
-    sys.path.insert(0, 'external/MioCodec/src')
-    from eval_mcs_trans_audio import load_mio, load_wave, SAMPLE_RATE
-    import torch
-    
+    from astrape.miocodec import load_mio, load_wave, SAMPLE_RATE
+    import torch, torchaudio
+    import torch.nn.functional as F
+
     mio = load_mio('cpu').eval()
     fe = mio.ssl_feature_extractor.model.feature_extractor
-    wavlm_dir = data_dir / 'wavlm_cnn'
-    wavlm_dir.mkdir(exist_ok=True)
-    
+    wavlm_dir = Path(subdir) if Path(subdir).is_absolute() else data_dir / subdir
+    wavlm_dir.mkdir(parents=True, exist_ok=True)
+
     to_fix = set()
     for i, _ in broken:
         to_fix.add(i)
     for i in missing:
         to_fix.add(i)
-    
+
     fixed = 0
     for i in sorted(to_fix):
         try:
             wav = load_wave(Path(str(srcs[i])), SAMPLE_RATE, max_seconds=6.0)
+            wav_16 = torchaudio.functional.resample(
+                wav.unsqueeze(0), SAMPLE_RATE, 16000).squeeze(0)
             with torch.no_grad():
-                cnn, _ = fe(wav.unsqueeze(0), length=None)
-            cnn_ds = torch.nn.functional.avg_pool1d(
-                cnn.transpose(1, 2), 3, 3
-            ).transpose(1, 2).squeeze(0).cpu().numpy().astype(np.float32)
-            np.save(wavlm_dir / f's_{i:05d}.npy', cnn_ds)
+                x = wav_16.unsqueeze(0)
+                for layer_idx in range(5):
+                    layer = fe.conv_layers[layer_idx]
+                    x = layer.conv(x)
+                    if hasattr(layer, 'layer_norm') and layer.layer_norm is not None:
+                        x = (layer.layer_norm(x.unsqueeze(0)).squeeze(0)
+                             if x.dim() == 2 else layer.layer_norm(x))
+                    x = F.gelu(x)
+            cnn = x.squeeze(0).transpose(0, 1).cpu().numpy().astype(np.float32)  # (T, 512)
+            np.save(wavlm_dir / f's_{i:05d}.npy', cnn)
             fixed += 1
         except Exception as e:
             print(f'  FAILED s_{i:05d}: {e}')
         if fixed % 100 == 0:
             print(f'  {fixed}/{len(to_fix)}')
-    
+
     print(f'  Repaired {fixed}/{len(to_fix)} files')
 
 def main():
@@ -109,6 +128,9 @@ def main():
     ap.add_argument('--repair', action='store_true', help='Auto-repair broken files')
     ap.add_argument('--wavlm-only', action='store_true')
     ap.add_argument('--npz-only', action='store_true')
+    ap.add_argument('--wavlm-dir', default='wavlm_L4_200hz',
+                    help='WavLM cache subdir to check (relative to data-dir or absolute). '
+                         'e.g. wavlm_L4_200hz (StridingAdapter), wavlm_L4, wavlm_16k')
     args = ap.parse_args()
     
     data_dir = Path(args.data_dir)
@@ -131,8 +153,8 @@ def main():
         broken_npz, missing_npz = [], []
     
     if not args.npz_only:
-        broken_wl, missing_wl = check_wavlm(data_dir, args.repair, srcs, meta)
-        print(f'  WavLM broken: {len(broken_wl)}')
+        broken_wl, missing_wl = check_wavlm(data_dir, args.repair, srcs, meta, args.wavlm_dir)
+        print(f'  WavLM ({args.wavlm_dir}) broken: {len(broken_wl)}')
         if broken_wl:
             for i, err in broken_wl[:5]:
                 print(f'    s_{i:05d}: {err}')
@@ -140,9 +162,9 @@ def main():
         print(f'  WavLM missing: {len(missing_wl)}')
         if missing_wl:
             print(f'    Range: s_{min(missing_wl):05d} .. s_{max(missing_wl):05d}')
-        
+
         if args.repair and (broken_wl or missing_wl):
-            repair_files(broken_wl, missing_wl, data_dir, srcs)
+            repair_files(broken_wl, missing_wl, data_dir, srcs, args.wavlm_dir)
     else:
         broken_wl, missing_wl = [], []
     

@@ -41,20 +41,15 @@ except ImportError:
     load_calibrator = None  # type: ignore
 
 
-MIO_CONFIG = Path(
-    "/Users/asill/.cache/huggingface/hub/models--Aratako--MioCodec-25Hz-44.1kHz-v2/"
-    "snapshots/67faba34153fe74e6665991c432a7327e23c5c1c/config.yaml"
+from astrape.miocodec import (  # bridge moved to the package (single home)
+    MIO_CONFIG, MIO_WEIGHTS, SAMPLE_RATE, load_wave, write_wave, load_mio,
 )
-MIO_WEIGHTS = Path(
-    "/Users/asill/.cache/huggingface/hub/models--Aratako--MioCodec-25Hz-44.1kHz-v2/"
-    "snapshots/67faba34153fe74e6665991c432a7327e23c5c1c/model.safetensors"
-)
+
 DEFAULT_DATA_DIR = Path("data/mio_vctk_full_compact")
 DEFAULT_CHECKPOINT = Path("checkpoints/mcs_trans_t6_causal_ft/mcs_trans_t6_causal_ft.best.pt")
 DEFAULT_SOURCE_AUDIO_DIR = Path("refs/source_audio")
 DEFAULT_TARGET_AUDIO = Path("/Users/asill/Downloads/abcdefgh.mp3")
 DEFAULT_OUT_DIR = Path("eval_out/mcs_trans_audio")
-SAMPLE_RATE = 44100
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,28 +74,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_wave(path: Path, sample_rate: int, max_seconds: float | None = None) -> torch.Tensor:
-    try:
-        data, sr = sf.read(str(path), dtype="float32", always_2d=False)
-        wav = torch.from_numpy(np.asarray(data))
-        if wav.ndim == 2:
-            wav = wav.mean(dim=1)
-    except Exception:
-        wav, sr = torchaudio.load(str(path))
-        wav = wav.mean(dim=0)
-    if sr != sample_rate:
-        wav = torchaudio.functional.resample(wav, sr, sample_rate)
-    if max_seconds is not None:
-        max_len = int(round(max_seconds * sample_rate))
-        wav = wav[:max_len]
-    return wav.contiguous().float()
-
-
-def write_wave(path: Path, wav: torch.Tensor, sample_rate: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(path), wav.detach().cpu().float().numpy(), sample_rate)
-
-
 def load_mcs_trans(path: Path, device: torch.device) -> MCSTrans:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     config = MCSTransConfig(
@@ -108,19 +81,6 @@ def load_mcs_trans(path: Path, device: torch.device) -> MCSTrans:
     )
     model = MCSTrans(config)
     model.load_state_dict(checkpoint["state_dict"], strict=True)
-    return model.to(device).eval()
-
-
-def load_mio(device: torch.device):
-    import logging
-
-    import miocodec
-
-    logging.disable(logging.INFO)
-    model = miocodec.MioCodecModel.from_pretrained(
-        config_path=str(MIO_CONFIG),
-        weights_path=str(MIO_WEIGHTS),
-    )
     return model.to(device).eval()
 
 

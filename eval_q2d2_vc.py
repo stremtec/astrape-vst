@@ -8,7 +8,7 @@ import torch, torchaudio, argparse
 import numpy as np
 from pathlib import Path
 
-from eval_mcs_trans_audio import load_mio, load_wave, SAMPLE_RATE
+from astrape.miocodec import load_mio, load_wave, SAMPLE_RATE
 from train_mcs_q2d2 import MCSTransQ2D2Config, MCSTransQ2D2
 
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"

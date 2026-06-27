@@ -69,40 +69,43 @@ from astrape.voicebank import VoiceBank
 
 ## Prerequisites
 
-- Extract WavLM cache (one-time, ~60 min):
+- Extract caches (one-time):
   ```bash
-  .venv/bin/python cache_wavlm_16k.py
+  .venv/bin/python cache.py --what wavlm --limit 0          # WavLM L4 200Hz (encoder frontend)
+  .venv/bin/python cache.py --what speakers --utts-per-speaker 8   # per-speaker centroids (decoder)
   ```
 - Verify cache integrity:
   ```bash
-  .venv/bin/python check_cache.py --wavlm-only
+  .venv/bin/python check_cache.py --wavlm-only --wavlm-dir wavlm_L4_200hz
   ```
 
 ## Project Structure
 
 ```
-train_mcs_q2d2.py         ★ Encoder training (Q2D2 + RoPE + SwiGLU + GRL + WavLM)
-train_decoder.py           ★ Decoder Phase 0 training (MR-STFT + Mel L1)
-mcs_common.py              CausalConv1d, DepthwiseResidualBlock, dataset, MR-STFT loss
-mcs_q2d2.py                Q2D2 quantizer (ICML 2026)
-cache_wavlm_16k.py         16kHz WavLM CNN cache extraction
-cache_wavlm_cnn.py          44.1kHz WavLM CNN cache (legacy)
-check_cache.py              Cache integrity checker
-eval_q2d2_vc.py             VC evaluation
-eval_mcs_trans_audio.py     MioCodec bridge utilities
-astrape/                    Core library
-  causal_decoder.py           Decoder v4 (7.08M, 31.9ms, Conv / Mamba)
-  mamba_block.py              Mamba SSM block (experimental, CPU-only)
-  encoder.py                  Causal Content Encoder
-  fsq.py, data.py, audio.py   Supporting modules
-  voicebank.py                VoiceBank management
-  wave_decoder.py             CausalConv1d base
-tests/                      Test scripts
+# Root — thin CLIs (+ encoder, packaged into astrape/ in Phase 2)
+train_mcs_q2d2.py     ★ Encoder training (Q2D2 + RoPE + SwiGLU + GRL + StridingAdapter)
+train_decoder.py      ★ Decoder v5 training (2-phase: recon warmup → MPD/MSD adversarial)
+cache.py               WavLM + speaker-centroid caching  (--what wavlm | speakers)
+build_voicebank.py     Build .astrape voicebank (chunked + energy-gated + averaged)
+eval_q2d2_vc.py / eval_mcs_trans_audio.py   VC / listening-set evaluation
+check_cache.py         Cache integrity checker
+mcs_common.py          Encoder shared (dataset, conv blocks, losses)   [Phase 2: split]
+mcs_q2d2.py            shim → astrape.quantizer
+
+astrape/               Core library
+  nn.py                Shared primitives (CausalConv1d, RoPE, SnakeBeta, AdaLN layer)
+  decoder.py           Decoder v5 (~16M, strict-causal, NSF, iSTFT n_fft=1512)
+  discriminators.py    MPD + MSD (adversarial; training-only, MPS-safe)
+  quantizer.py         Q2D2 quantizer (ICML 2026)
+  data.py              Decoder dataset (Phase0Dataset) + teacher Gaussian blur
+  miocodec.py          MioCodec bridge (load_mio/load_wave/write_wave + speaker extraction)
+  voicebank.py         .astrape VoiceBank format
+tests/
   test_streaming_invariant.py  Streaming causality tests
 
-data/mio_vctk_full_compact/   VCTK dataset (npz cache)
-data/mio_vctk_full_compact/wavlm_16k/   16kHz WavLM CNN cache (14GB)
-wavlm_16k_local/              Local copy of WavLM cache (for training stability)
+data/mio_vctk_full_compact/   VCTK npz cache
+data/mio_vctk_full_compact/wavlm_L4_200hz/   WavLM L4 200Hz cache (encoder frontend)
+data/mio_vctk_full_compact/spk_centroids.npz  per-speaker MioCodec global centroids
 checkpoints/ → /Volumes/UNTITLED/btrv5_checkpoints/
 ```
 

@@ -60,10 +60,16 @@ class MioCompactDataset(Dataset):
 
 
 class ContentCollator:
-    def __init__(self, mel_frames: int | None, seed: int, pad_mel_multiple: int = 2):
+    def __init__(self, mel_frames: int | None, seed: int, pad_mel_multiple: int = 2,
+                 frames_per_token: int = 2):
         self.mel_frames = mel_frames
         self.rng = random.Random(seed)
         self.pad_mel_multiple = pad_mel_multiple
+        # Frontend ("mel") frames per teacher token (25Hz content).  Mel and the
+        # 50Hz WavLM cache are 2:1; the 200Hz L4 raw cache is 8:1.  Crops must use
+        # this ratio to keep the cropped frontend window aligned with the cropped
+        # content/token window (a hard-coded 2 overruns and mis-pairs at 200Hz).
+        self.frames_per_token = frames_per_token
 
     def _crop(self, sample: dict) -> tuple:
         mel = sample["mel"]
@@ -76,13 +82,14 @@ class ContentCollator:
         if self.mel_frames is None or mel.shape[1] <= self.mel_frames:
             return mel, content, tokens, ssl0, ssl4, ssl8, 0, idx
 
+        R = self.frames_per_token
         max_start = mel.shape[1] - self.mel_frames
         start = self.rng.randint(0, max_start)
-        start -= start % 2
+        start -= start % R                       # align crop to a token boundary
         mel = mel[:, start : start + self.mel_frames]
-        token_start = start // 2
-        token_len = math.ceil(mel.shape[1] / 2)
-        ssl_start = token_start * 2
+        token_start = start // R
+        token_len = math.ceil(mel.shape[1] / R)
+        ssl_start = token_start * 2              # SSL features are 50Hz = 2× token rate
         ssl_len = token_len * 2
         return (
             mel,
@@ -267,9 +274,18 @@ def _voiced_weights(mel: torch.Tensor, length: int, voiced_boost: float) -> torc
     if voiced_boost <= 1.0:
         return mel.new_ones(mel.shape[0], length)
     t_mel = mel.shape[2]
-    t_tok = min(length, t_mel // 2)
-    mel_pairs = mel[:, :, : t_tok * 2].reshape(mel.shape[0], mel.shape[1], t_tok, 2)
-    rms = mel_pairs.pow(2).mean(dim=(1, 3)).sqrt()
+    # Frontend frames per content frame.  Mel and the 50Hz WavLM cache run at
+    # 2× the content rate (factor=2); the 200Hz L4 raw cache runs at 8×.
+    # Deriving the factor from the actual lengths keeps the voiced mask
+    # time-aligned with the content frames for every frontend rate.  (Was
+    # hard-coded to 2, which mis-mapped — and silently dropped 3/4 of — the
+    # utterance when the 200Hz StridingAdapter frontend was used.)
+    factor = max(1, int(round(t_mel / length)))
+    t_tok = min(length, t_mel // factor)
+    mel_groups = mel[:, :, : t_tok * factor].reshape(
+        mel.shape[0], mel.shape[1], t_tok, factor
+    )
+    rms = mel_groups.pow(2).mean(dim=(1, 3)).sqrt()
     threshold = rms.mean(dim=1, keepdim=True).clamp(min=1e-5)
     voiced = (rms > threshold * 0.5).float()
     weights = 1.0 + (voiced_boost - 1.0) * voiced

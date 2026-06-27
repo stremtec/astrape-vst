@@ -129,9 +129,17 @@ class SpeakerClassifier(nn.Module):
             nn.Linear(hidden, num_speakers),
         )
 
-    def forward(self, content: torch.Tensor) -> torch.Tensor:
-        # content: (B, 768, T) → pool → (B, 768)
-        pooled = content.mean(dim=-1)  # average over time
+    def forward(self, content: torch.Tensor,
+                mask: torch.Tensor | None = None) -> torch.Tensor:
+        # content: (B, 768, T) → temporal mean → (B, 768)
+        if mask is not None:
+            # Masked mean: ignore right-padding frames so the pooled speaker
+            # embedding isn't diluted by zeros (which biases the GRL signal by
+            # a batch-composition-dependent factor).
+            m = mask.unsqueeze(1).to(content.dtype)  # (B, 1, T)
+            pooled = (content * m).sum(dim=-1) / m.sum(dim=-1).clamp(min=1.0)
+        else:
+            pooled = content.mean(dim=-1)  # average over time
         return self.net(pooled)  # (B, num_speakers)
 
 
@@ -406,8 +414,14 @@ class WavLMFrontendAdapter(nn.Module):
         stride = max(1, wavlm_rate // 50)  # e.g., 200//50 = 4
 
         if stride > 1:
-            # Learned stride-down: CausalConv + projection
-            self.down = CausalConv1d(in_dim, in_dim//2, kernel_size=2,
+            # Learned stride-down: CausalConv + projection.
+            # kernel_size == stride ⇒ the decimation window covers ALL input
+            # frames (every 200Hz frame reaches exactly one output).  A smaller
+            # kernel (e.g. 2) would skip stride-2 of every stride frames, i.e.
+            # silently discard ~50% of the cached WavLM features.  Causal
+            # (left-padded) ⇒ the wider window is backward context only and
+            # adds NO look-ahead latency.
+            self.down = CausalConv1d(in_dim, in_dim//2, kernel_size=stride,
                                      stride=stride, groups=in_dim//2)
         else:
             self.down = nn.Identity()
@@ -769,14 +783,21 @@ def q2d2_losses(
     if forecast_weight > 0:
         fc1 = output.get("forecast_1")
         fc2 = output.get("forecast_2")
-        if fc1 is not None and fc2 is not None and length >= 3:
-            fc1_flat = fc1[:, :, ts:ts + length].permute(0, 2, 1)
-            fc2_flat = fc2[:, :, ts:ts + length].permute(0, 2, 1)
-            Lf = min(length, batch.content.shape[1] - 2)
+        # Lf bounded so the target/mask shifts (t+1, t+2) stay in range.
+        Lf = min(length - 2, batch.content.shape[1] - 2)
+        if fc1 is not None and fc2 is not None and length >= 3 and Lf >= 1:
+            fc1_flat = fc1[:, :, ts:ts + length].permute(0, 2, 1)[:, :Lf, :]
+            fc2_flat = fc2[:, :, ts:ts + length].permute(0, 2, 1)[:, :Lf, :]
             tgt_fc1 = batch.content[:, 1:1 + Lf]
             tgt_fc2 = batch.content[:, 2:2 + Lf]
-            fl1 = F.mse_loss(fc1_flat[:, :Lf, :], tgt_fc1, reduction="mean")
-            fl2 = F.mse_loss(fc2_flat[:, :Lf, :], tgt_fc2, reduction="mean")
+            # Mask: predict only where BOTH the source frame and the future
+            # target frame are valid (excludes right-padding).
+            m1 = (mask[:, :Lf] & mask[:, 1:1 + Lf]).float()
+            m2 = (mask[:, :Lf] & mask[:, 2:2 + Lf]).float()
+            fl1 = (F.mse_loss(fc1_flat, tgt_fc1, reduction="none").mean(-1) * m1
+                   ).sum() / m1.sum().clamp(min=1)
+            fl2 = (F.mse_loss(fc2_flat, tgt_fc2, reduction="none").mean(-1) * m2
+                   ).sum() / m2.sum().clamp(min=1)
             fl = (fl1 + fl2) * 0.5
             forecast_loss_val = float(fl.detach().cpu())
             loss = loss + forecast_weight * fl
@@ -788,9 +809,10 @@ def q2d2_losses(
         grl_weight = getattr(args, "grl_weight", 0.0)
         if grl_weight > 0:
             # Reverse gradient: classifier tries to predict speaker,
-            # but encoder gets reversed gradient → strips speaker info
-            grl_content = grad_reverse(projected, grl_weight)
-            speaker_logits = speaker_classifier(grl_content)
+            # but encoder gets reversed gradient → strips speaker info.
+            # Pool over the valid (masked) loss region only.
+            grl_content = grad_reverse(projected[:, :, ts:ts + length], grl_weight)
+            speaker_logits = speaker_classifier(grl_content, mask)
             grl_loss = F.cross_entropy(speaker_logits, speaker_ids)
             loss = loss + grl_loss
             grl_loss_val = float(grl_loss.detach().cpu())
@@ -1128,18 +1150,30 @@ def main() -> None:
         print(f"WavLM frontend: using cached {args.wavlm_dir} (512d) instead of mel",
               flush=True)
 
+    # Frontend frames per 25Hz teacher token: Mel/50Hz-WavLM = 2, 200Hz L4 = 8.
+    frames_per_token = (args.wavlm_rate // 25) if args.wavlm_frontend else 2
+    # persistent_workers: keep workers alive across epochs instead of respawning
+    # them each epoch (the respawn leaks ~17 fds/epoch and hits macOS's default
+    # ulimit -n=256 after ~15 epochs). Requires num_workers > 0.
+    persistent = args.num_workers > 0
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=ContentCollator(args.mel_frames, args.seed),
+        persistent_workers=persistent,
+        collate_fn=ContentCollator(args.mel_frames, args.seed,
+                                   pad_mel_multiple=frames_per_token,
+                                   frames_per_token=frames_per_token),
         generator=torch.Generator().manual_seed(args.seed),
     )
     probe_loader = DataLoader(
         probe_ds,
         batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers,
-        collate_fn=ContentCollator(args.eval_mel_frames, args.seed + 999),
+        persistent_workers=persistent,
+        collate_fn=ContentCollator(args.eval_mel_frames, args.seed + 999,
+                                   pad_mel_multiple=frames_per_token,
+                                   frames_per_token=frames_per_token),
     )
 
     # ── config ──
