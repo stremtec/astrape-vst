@@ -686,33 +686,37 @@ def main() -> None:
                 sps = elapsed / s
                 eta_h = sps * (total_steps_all - steps_done) / 3600
 
-                # Trend: cos↑ or ↓, usage state
+                # Combined trend: cos direction + usage direction
                 avg_cos = totals['cos768'] / s
                 avg_use = totals.get('q2d2_usage', 0) / s
                 if prev_cos768 > 0:
                     d_cos = avg_cos - prev_cos768
-                    if d_cos > 0.001:
-                        trend_cos = '\u2191'  # ↑ increasing
-                    elif d_cos < -0.001:
-                        trend_cos = '\u2193'  # ↓ decreasing
-                    else:
-                        trend_cos = '\u2192'  # → plateau
                     d_use = avg_use - prev_usage
-                    if avg_use < prev_usage - 0.005:
-                        phase = '\u2699'  # ⚙ compression
-                    elif avg_use > prev_usage + 0.005:
-                        phase = '\u2b06'  # ⬆ expansion
+
+                    if d_cos > 0.001:
+                        cd = '\u2191'  # cos↑
+                    elif d_cos < -0.001:
+                        cd = '\u2193'  # cos↓
                     else:
-                        phase = '\u2194'  # ↔ stable
+                        cd = '\u2192'  # cos→
+
+                    if d_use < -0.003:
+                        ud = '\u2699'   # usage↓ (compression)
+                    elif d_use > 0.003:
+                        ud = '\u2b06'   # usage↑ (expansion)
+                    else:
+                        ud = '\u2194'   # usage↔
+
+                    trend = f'{ud}{cd}'
                 else:
-                    trend_cos, phase = '\u00b7', '\u00b7'  # · unknown
+                    trend = '\u00b7'
                 prev_cos768, prev_usage = avg_cos, avg_use
 
                 print(
                     f"E{epoch:03d} [{bar}] {pct:3d}% "
-                    f"| loss={totals['loss']/s:.4f} cos={avg_cos:.4f} {trend_cos} "
+                    f"| loss={totals['loss']/s:.4f} cos={avg_cos:.4f} "
                     f"l1={totals.get('content_l1',0)/s:.4f} "
-                    f"use={avg_use:.3f} {phase} "
+                    f"use={avg_use:.3f} {trend} "
                     f"| {sps:.2f}s | ETA {eta_h:.1f}h",
                     flush=True,
                 )
