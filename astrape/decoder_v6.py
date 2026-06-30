@@ -97,8 +97,30 @@ class CausalLowPass(nn.Module):
         return F.conv1d(F.pad(x, (self.ksize - 1, 0)), self.k, groups=self.ch)
 
 
+# ═══════════════════════════════════════════════════════════════════
+# AA fractional upsampler: ×7 → low-pass → stride-2 = ×3.5 (50→175Hz)
+# ═══════════════════════════════════════════════════════════════════
+
+class AAFracUpsample(nn.Module):
+    """Anti-aliased fractional upsample: nearest-repeat ×N → low-pass → stride-2 causal conv.
+    Causal: low-pass uses left-pad, stride-2 uses NO look-ahead.
+    """
+    def __init__(self, channels: int, factor: float):
+        super().__init__()
+        # ×7 integer upsample then stride-2 = ×3.5
+        up = int(factor * 2)  # 7
+        self.up = up
+        self.lp = CausalLowPass(channels, cutoff=0.5 / factor, ksize=2 * up + 1)
+        self.decimate = CausalConv1d(channels, channels, kernel_size=up, stride=2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = F.interpolate(x, scale_factor=self.up, mode="nearest")  # ×7
+        h = self.lp(h)                                               # anti-alias
+        return self.decimate(h)                                      # ×3.5
+
+
 class AAUpsample(nn.Module):
-    """Anti-aliased ×factor upsample: nearest-repeat → low-pass."""
+    """Anti-aliased integer upsample: nearest-repeat → low-pass."""
     def __init__(self, channels: int, factor: int):
         super().__init__()
         self.factor = factor
@@ -284,6 +306,41 @@ class InterpSmooth(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Vocos-style 2D ISTFT Head — frequency-axis conv for phase coherence
+# ═══════════════════════════════════════════════════════════════════
+
+class ISTFTHead2D(nn.Module):
+    """Projects time-features → freq bins → Conv2d(T,F) → mag+phase.
+
+    Unlike standard ISTFTHead (independent per-bin Linear), this head:
+    1. Projects to (hidden, T, n_freq) grid via Linear
+    2. Applies Conv2d over time×frequency grid (Vocos-style)
+    3. Collapses to per-bin mag+phase
+    This gives neighboring freq bins shared context for harmonic phase coherence.
+    """
+    def __init__(self, in_dim: int, n_freq: int, hidden: int = 32):
+        super().__init__()
+        self.n_freq = n_freq
+        self.proj = nn.Linear(in_dim, hidden * n_freq)
+        self.conv = nn.Sequential(
+            nn.Conv2d(hidden, hidden, (3, 5), padding=(1, 2)),  # T×F conv
+            nn.GELU(),
+            nn.Conv2d(hidden, 2, 1),                            # → mag+phase
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """x: (B, T, in_dim) → (mag_log, phase) each (B, n_freq, T)"""
+        B, T, _ = x.shape
+        h = self.proj(x)                                # (B, T, hidden*n_freq)
+        h = h.reshape(B, T, self.n_freq, -1)            # (B, T, n_freq, hidden)
+        h = h.permute(0, 3, 1, 2)                       # (B, hidden, T, n_freq)
+        h = self.conv(h)                                 # (B, 2, T, n_freq)
+        h = h.permute(0, 1, 3, 2)                       # (B, 2, n_freq, T)
+        mag_log, phase = h[:, 0], h[:, 1]               # (B, n_freq, T)
+        return mag_log, phase
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Full v6 decoder
 # ═══════════════════════════════════════════════════════════════════
 
@@ -347,19 +404,20 @@ class CausalDecoderV6(nn.Module):
         self.post_smooth = nn.ModuleList([
             CausalConvNeXtBlock(W, kernel=5) for _ in range(2)
         ])
-        self.interp_smooth = InterpSmooth(W, factor=3.5)
+        self.frac_up = AAFracUpsample(W, factor=3.5)
 
-        # ⑥ Bridge + ISTFT head — CausalResNet refinement before mag/phase projection
+        # ⑥ Bridge + ISTFT head — frequency-aware mag/phase prediction
+        #    The bridge outputs 512d time-domain features, then a 2D head
+        #    projects to freq bins + applies frequency-axis conv (Vocos-style).
         from .causal_wave_decoder import CausalResNetBlock
         self.istft_bridge = nn.Sequential(
             CausalResNetBlock(W, kernel_size=7),
             CausalResNetBlock(W, kernel_size=7),
             nn.Conv1d(W, c.istft_bridge_dim, kernel_size=1),
         )
-        from miocodec.module.istft_head import ISTFTHead
-        self.istft_head = ISTFTHead(
-            dim=c.istft_bridge_dim, n_fft=c.n_fft,
-            hop_length=c.hop_length, padding=c.istft_padding,
+        n_freq = c.n_fft // 2 + 1  # 757 for n_fft=1512
+        self.istft_head_2d = ISTFTHead2D(
+            in_dim=c.istft_bridge_dim, n_freq=n_freq,
         )
 
     def _compute_stft_length(self, content_frames: int) -> int:
@@ -411,21 +469,21 @@ class CausalDecoderV6(nn.Module):
             h_a = layer(h_a, prosody_50, self.fusion_rope, self.config.fusion_window)
         h = self.fusion_norm(h_a).transpose(1, 2)       # (B, 512, 2T)
 
-        # ⑤ Post-fusion refinement + fractional upsample 50Hz → STFT rate
+        # ⑤ Post-fusion refinement + AA fractional upsample 50Hz → STFT rate
         for block in self.post_smooth:
             h = block(h)
-        # Linear interp ×3.5 (smoother than nearest-repeat, causal in practice)
-        # 50Hz × 3.5 = 175Hz = STFT rate for n_fft=1512/hop=252
-        if stft_length != h.shape[-1]:
-            h = F.interpolate(h, size=stft_length, mode="linear")
-        h = self.interp_smooth(h)    # de-jaggify repeated frames (fixes phase stair-step)
+        # AA-fractional: ×7 → low-pass → stride-2 = ×3.5 (175Hz)
+        # No stair-step, no phase jumps — anti-aliased throughout
+        h = self.frac_up(h)  # (B, W, stft_length)
 
         # ⑥ Bridge + ISTFT
         h = self.istft_bridge(h).transpose(1, 2)         # (B, stft_len, bridge_dim)
-        xo = self.istft_head.out(h).transpose(1, 2)     # (B, n_fft+2, stft_len)
-        mag_log, phase = xo.chunk(2, dim=1)
+        mag_log, phase = self.istft_head_2d(h)           # (B, n_freq, stft_len) each
         mag = torch.exp(mag_log).clamp(max=1e2)
-        wav = self.istft_head.istft(torch.complex(mag * torch.cos(phase), mag * torch.sin(phase)))
+        from miocodec.module.istft_head import ISTFT
+        istft = ISTFT(n_fft=self.config.n_fft, hop_length=self.config.hop_length,
+                      win_length=self.config.n_fft, padding=self.config.istft_padding)
+        wav = istft(torch.complex(mag * torch.cos(phase), mag * torch.sin(phase)))
         if return_spec:
             return wav, mag, phase
         return wav
