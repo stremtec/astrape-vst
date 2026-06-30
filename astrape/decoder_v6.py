@@ -103,14 +103,15 @@ class CausalLowPass(nn.Module):
 
 class AAFracUpsample(nn.Module):
     """Anti-aliased fractional upsample: nearest-repeat ×N → low-pass → stride-2 causal conv.
+    cutoff = 0.5/up (π/L) suppresses all images from nearest-repeat before stride-2 decimation.
     Causal: low-pass uses left-pad, stride-2 uses NO look-ahead.
     """
     def __init__(self, channels: int, factor: float):
         super().__init__()
-        # ×7 integer upsample then stride-2 = ×3.5
-        up = int(factor * 2)  # 7
+        up = int(factor * 2)  # 7 for ×3.5
         self.up = up
-        self.lp = CausalLowPass(channels, cutoff=0.5 / factor, ksize=2 * up + 1)
+        # cutoff = 0.5/up = π/L: prevents imaging from nearest-repeat before stride-2
+        self.lp = CausalLowPass(channels, cutoff=0.5 / up, ksize=2 * up + 1)
         self.decimate = CausalConv1d(channels, channels, kernel_size=up, stride=2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -323,7 +324,8 @@ class ISTFTHead2D(nn.Module):
         self.n_freq = n_freq
         self.proj = nn.Linear(in_dim, hidden * n_freq)
         self.conv = nn.Sequential(
-            nn.Conv2d(hidden, hidden, (3, 5), padding=(1, 2)),  # T×F conv
+            # Causal temporal conv: pad time axis on left only
+            nn.Conv2d(hidden, hidden, (3, 5), padding=(0, 2)),
             nn.GELU(),
             nn.Conv2d(hidden, 2, 1),                            # → mag+phase
         )
@@ -334,7 +336,11 @@ class ISTFTHead2D(nn.Module):
         h = self.proj(x)                                # (B, T, hidden*n_freq)
         h = h.reshape(B, T, self.n_freq, -1)            # (B, T, n_freq, hidden)
         h = h.permute(0, 3, 1, 2)                       # (B, hidden, T, n_freq)
-        h = self.conv(h)                                 # (B, 2, T, n_freq)
+        # Causal left-pad on time axis: pad 2 frames on left, 0 on right
+        h = F.pad(h, (0, 0, 2, 0))                     # (freq, freq, time_left, time_right)
+        h = self.conv[0](h)                             # Conv2d without time padding
+        h = self.conv[1](h)                             # GELU
+        h = self.conv[2](h)                             # → mag+phase
         h = h.permute(0, 1, 3, 2)                       # (B, 2, n_freq, T)
         mag_log, phase = h[:, 0], h[:, 1]               # (B, n_freq, T)
         return mag_log, phase
@@ -351,11 +357,12 @@ class CausalDecoderV6(nn.Module):
         content(768) @25Hz + speaker(128)
           ① Content Projection       Linear 768→384                        @25Hz
           ② Prosody Embedding        LSTM(content+speaker) → condition     @25Hz
-          ③ Content Smoothing        ConvNeXt-v2 ×4                       @25Hz
+          ③ Content Smoothing        ConvNeXt ×4                          @25Hz
           ③ AA Rate ×2               BigVGAN-v2 upsample 384→512          @50Hz
-          ④ Speaker-Content Fusion   AdaLN-Transformer + DilatedTCN       @50Hz
-          ⑤ AA Upsampler ×9          (3,3)                                @450Hz
-          ⑥ ISTFT Head               n_fft=392, hop=98                    → 44.1kHz
+          ④ Speaker-Content Fusion   AdaLN Transformer (causal)           @50Hz
+          ⑤ AA Fractional Upsample   AAFracUpsample ×3.5                  @175Hz
+          ⑥ ISTFT Head 2D            Conv2d(T×F) → mag+phase → ISTFT     → 44.1kHz
+          n_fft=1512, hop=252, 757 freq bins, 14.3ms algorithmic latency
     """
     def __init__(self, config: CausalDecoderV6Config = CausalDecoderV6Config()):
         super().__init__()
@@ -440,12 +447,11 @@ class CausalDecoderV6(nn.Module):
         if stft_length is None:
             stft_length = self._compute_stft_length(T)
 
-        # ② Prosody embedding: LSTM reads full content+speaker prefix
-        #    This is the key new component — causal substitute for bidirectional prenet
-        prosody_cond = self.prosody(content, speaker)   # (B, T, prosody_cond_dim)
-
-        # ① Content projection (after prosody, so we use raw content for both)
+        # ① Scale content first, then use same scaled content everywhere
         h = content * self.input_scale.to(dtype=content.dtype)
+
+        # ② Prosody embedding: LSTM reads scaled content+speaker prefix
+        prosody_cond = self.prosody(h, speaker)          # (B, T, prosody_cond_dim)
         h = self.content_proj(h)                         # (B, T, 384)
 
         # ③ Content smoothing @25Hz

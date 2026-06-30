@@ -1,6 +1,6 @@
 """Train CausalDecoderV6 by output distillation from the frozen MioCodec teacher.
 
-Loss: MR-STFT (main) + Mel-L1 (aux) + small complex-STFT (phase nudge, 0.01).
+Loss: MR-STFT (main) + Mel-L1 (aux) + complex-STFT (real+imag) + anti-wrap phase.
 Spectral losses computed on CPU (MPS torch.stft backward is non-finite).
 No GAN needed — distillation from the teacher's correct output is sufficient
 (and matches the proven recipe from train_mcs_decoder.py).
