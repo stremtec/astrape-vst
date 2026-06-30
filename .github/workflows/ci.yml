@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+      - run: uv sync --only-dev
+      - run: uv run ruff check astrape/ tests/ export.py
+      - run: uv run ruff format --check astrape/ tests/ export.py
+
+  typecheck:
+    name: Type check (mypy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+      - run: uv sync
+      - run: uv run mypy astrape/ --ignore-missing-imports
+
+  import-check:
+    name: Import check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+      - run: uv sync
+      - name: Verify all modules import
+        run: |
+          python -c "
+          import sys, importlib, pathlib, traceback
+          pkg = pathlib.Path('astrape')
+          failures = []
+          for f in sorted(pkg.rglob('*.py')):
+              if f.name.startswith('_') or f.name == '__init__.py':
+                  continue
+              mod = '.'.join(f.relative_to(pkg.parent).with_suffix('').parts)
+              try:
+                  importlib.import_module(mod)
+                  print(f'  OK  {mod}')
+              except Exception:
+                  failures.append(mod)
+                  traceback.print_exc()
+          if failures:
+              print(f'\nFAILED: {len(failures)} modules', file=sys.stderr)
+              sys.exit(1)
+          print(f'\nAll {sum(1 for _ in pkg.rglob(\"*.py\") if not _.name.startswith(\"_\")) - 1} modules imported successfully.')
+          "
+
+  test:
+    name: Test (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync
+      - name: Run streaming invariance tests
+        run: uv run python tests/test_streaming_invariant.py
+      - name: Run pytests
+        run: uv run pytest tests/ -v --tb=short --timeout=120 --no-header || [ $? -eq 5 ]

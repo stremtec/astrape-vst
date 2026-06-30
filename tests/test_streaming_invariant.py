@@ -17,6 +17,11 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+# Prevent pytest from collecting these — they're standalone test functions
+# that take a torch.device argument, not pytest fixtures. Run with:
+#   python tests/test_streaming_invariant.py
+__test__ = False
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "external" / "MioCodec" / "src"))
 

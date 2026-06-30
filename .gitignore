@@ -11,10 +11,12 @@ voicebanks/
 # Docs
 *.md
 !README.md
+!.github/pull_request_template.md
 
 # Build artifacts
 __pycache__/
 *.pyc
+*.egg-info/
 .venv/
 
 # Misc

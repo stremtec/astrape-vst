@@ -13,6 +13,8 @@ dependencies = [
   "soundfile>=0.12",
   "torch>=2.2",
   "torchaudio>=2.2",
+  "jsonargparse>=4.0",
+  "einops>=0.8",
 ]
 
 [tool.setuptools.packages.find]
@@ -21,4 +23,42 @@ include = ["astrape*"]
 [dependency-groups]
 dev = [
     "pytest>=9.1.0",
+    "pytest-timeout>=2.3",
+    "ruff>=0.11.0",
+    "mypy>=1.15",
+    "pre-commit>=4.0",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+]
+ignore = [
+    "E501",  # line-too-long (handled by formatter)
+    "B008",  # do-not-perform-function-calls-in-argument-defaults
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_return_any = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 120
