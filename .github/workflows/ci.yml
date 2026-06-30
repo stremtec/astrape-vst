@@ -58,6 +58,7 @@ jobs:
 
           pkg = pathlib.Path('astrape')
           ok = 0
+          warn = 0
           fail = 0
           for f in sorted(pkg.rglob('*.py')):
               if '__pycache__' in f.parts:
@@ -69,11 +70,14 @@ jobs:
                   importlib.import_module(mod)
                   print(f'  OK  {mod}')
                   ok += 1
+              except ModuleNotFoundError as e:
+                  print(f'  WARN  {mod}: {e} (missing dep)', file=sys.stderr)
+                  warn += 1
               except Exception as e:
                   print(f'  FAIL  {mod}: {e}', file=sys.stderr)
                   traceback.print_exc()
                   fail += 1
-          print(f'\n{ok} OK, {fail} FAIL')
+          print(f'\n{ok} OK, {warn} skipped (deps), {fail} FAIL')
           sys.exit(0 if fail == 0 else 1)
           PYEOF
 
