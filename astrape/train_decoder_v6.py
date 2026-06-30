@@ -45,7 +45,7 @@ def main():
     ap.add_argument("--resume", type=Path, default=None)
     ap.add_argument("--nffts", type=int, nargs="+", default=[512, 1024, 2048])
     ap.add_argument("--mel-weight", type=float, default=1.0)
-    ap.add_argument("--cstft-weight", type=float, default=0.01)
+    ap.add_argument("--cstft-weight", type=float, default=0.05)
     ap.add_argument("--clip-grad", type=float, default=1.0)
     # v6 architecture overrides
     ap.add_argument("--fusion-layers", type=int, default=4,

@@ -271,6 +271,19 @@ class CausalDecoderV6Config:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Upsample de-jaggifier (causal conv after fractional nearest-repeat)
+# ═══════════════════════════════════════════════════════════════════
+
+class InterpSmooth(nn.Module):
+    """Causal depthwise conv after fractional upsample — blends repeated frames."""
+    def __init__(self, dim: int, factor: float):
+        super().__init__()
+        k = int(factor * 2) + 1  # kernel=8 for ×3.5
+        self.conv = CausalConv1d(dim, dim, k, groups=dim)
+    def forward(self, x): return self.conv(x)
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Full v6 decoder
 # ═══════════════════════════════════════════════════════════════════
 
@@ -334,6 +347,7 @@ class CausalDecoderV6(nn.Module):
         self.post_smooth = nn.ModuleList([
             CausalConvNeXtBlock(W, kernel=5) for _ in range(2)
         ])
+        self.interp_smooth = InterpSmooth(W, factor=3.5)
 
         # ⑥ Bridge + ISTFT head — CausalResNet refinement before mag/phase projection
         from .causal_wave_decoder import CausalResNetBlock
@@ -404,6 +418,7 @@ class CausalDecoderV6(nn.Module):
         # 50Hz × 3.5 = 175Hz = STFT rate for n_fft=1512/hop=252
         if stft_length != h.shape[-1]:
             h = F.interpolate(h, size=stft_length, mode="nearest")
+        h = self.interp_smooth(h)    # de-jaggify repeated frames (fixes phase stair-step)
 
         # ⑥ Bridge + ISTFT
         h = self.istft_bridge(h).transpose(1, 2)         # (B, stft_len, bridge_dim)
