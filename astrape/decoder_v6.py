@@ -426,6 +426,10 @@ class CausalDecoderV6(nn.Module):
         self.istft_head_2d = ISTFTHead2D(
             in_dim=c.istft_bridge_dim, n_freq=n_freq,
         )
+        # ISTFT module (registered so window buffer follows device)
+        from miocodec.module.istft_head import ISTFT
+        self.istft = ISTFT(n_fft=c.n_fft, hop_length=c.hop_length,
+                           win_length=c.n_fft, padding=c.istft_padding)
 
     def _compute_stft_length(self, content_frames: int) -> int:
         return int(content_frames * self.config.sample_rate
@@ -486,10 +490,7 @@ class CausalDecoderV6(nn.Module):
         h = self.istft_bridge(h).transpose(1, 2)         # (B, stft_len, bridge_dim)
         mag_log, phase = self.istft_head_2d(h)           # (B, n_freq, stft_len) each
         mag = torch.exp(mag_log).clamp(max=1e2)
-        from miocodec.module.istft_head import ISTFT
-        istft = ISTFT(n_fft=self.config.n_fft, hop_length=self.config.hop_length,
-                      win_length=self.config.n_fft, padding=self.config.istft_padding)
-        wav = istft(torch.complex(mag * torch.cos(phase), mag * torch.sin(phase)))
+        wav = self.istft(torch.complex(mag * torch.cos(phase), mag * torch.sin(phase)))
         if return_spec:
             return wav, mag, phase
         return wav
