@@ -40,9 +40,10 @@ def evaluate_vs_teacher(dec, mio, loader, device, mel_fn, num_batches=20):
         tl = min(pred.shape[1], teacher.shape[1])
         p, t = pred[0, :tl].float(), teacher[0, :tl].float()
         wave_cos_all.append(F.cosine_similarity(p, t, dim=0).item())
-        # Mel cosine
-        pm = mel_fn(p.unsqueeze(0)).squeeze(0).flatten()
-        tm = mel_fn(t.unsqueeze(0)).squeeze(0).flatten()
+        # Mel cosine — compute on CPU (mel_fn is there)
+        p_cpu, t_cpu = p.cpu(), t.cpu()
+        pm = mel_fn(p_cpu.unsqueeze(0)).squeeze(0).flatten()
+        tm = mel_fn(t_cpu.unsqueeze(0)).squeeze(0).flatten()
         mel_cos_all.append(F.cosine_similarity(pm, tm, dim=0).item())
     return float(np.mean(wave_cos_all)), float(np.mean(mel_cos_all))
 
