@@ -292,47 +292,25 @@ class MambaBlock(nn.Module):
 class WavLMFrontendAdapter(nn.Module):
     """Projects cached WavLM CNN features (512d) to mel-like 80d.
 
-    Supports rate conversion: when wavlm_rate > 50Hz, downsamples to 50Hz.
-
-    down_type:
-        "conv"      — learned CausalConv1d (k=stride, flexible)
-        "pool"      — simple CausalAvgPool1d (fixed, 0 params)
-        "replicate" — CausalReplicatePool (fixed, replicate-boundary, 0 params, α-decay)
-
-    Args:
-        in_dim: input feature dim (512 for WavLM)
-        out_dim: output dim (80 for mel-compatible)
-        wavlm_rate: input rate in Hz (50 default, 200 for L4 raw)
-        dropout: dropout rate
+    Rate conversion: when wavlm_rate > 50Hz, uses CausalReplicatePool
+    (alpha-decaying replicate-pad + avg_pool) for 5ms delay, 0 params.
     """
     def __init__(self, in_dim: int = 512, out_dim: int = 80,
                  hidden: int = 256, wavlm_rate: int = 50,
-                 down_type: str = "pool",
                  dropout: float = 0.0):
         super().__init__()
         self.wavlm_rate = wavlm_rate
         stride = max(1, wavlm_rate // 50)
 
         if stride > 1:
-            if down_type == "replicate":
-                # Fixed: α-decaying replicate-pad + avg_pool (5ms delay, 0 params)
-                self.down = nn.Sequential(
-                    CausalReplicatePad(stride, alpha=0.8),
-                    nn.AvgPool1d(kernel_size=stride, stride=stride))
-            elif down_type == "pool":
-                # Fixed: causal avg_pool (15ms delay, 0 params)
-                self.down = CausalAvgPool1d(kernel_size=stride, stride=stride)
-            else:
-                # Learned: CausalConv1d (5ms delay, trainable)
-                self.down = CausalConv1d(in_dim, in_dim//2, kernel_size=stride,
-                                         stride=stride, groups=in_dim//2)
-            in_dim_after = in_dim if down_type in ("pool", "replicate") else in_dim//2
+            self.down = nn.Sequential(
+                CausalReplicatePad(stride, alpha=0.8),
+                nn.AvgPool1d(kernel_size=stride, stride=stride))
         else:
             self.down = nn.Identity()
-            in_dim_after = in_dim
 
         self.net = nn.Sequential(
-            nn.Linear(in_dim_after, hidden),
+            nn.Linear(in_dim, hidden),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, out_dim),
@@ -358,21 +336,6 @@ class CausalReplicatePad(nn.Module):
                                        device=x.device, dtype=x.dtype)
         pad = first * w.view(1, 1, -1)  # (B, C, stride-1)
         return torch.cat([pad, x], dim=-1)
-
-
-class CausalAvgPool1d(nn.Module):
-    """AvgPool1d with left-only padding (causal, k-1 frames delay)."""
-    def __init__(self, kernel_size: int, stride: int):
-        super().__init__()
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.pool = nn.AvgPool1d(kernel_size, stride)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, T). Pad LEFT only.
-        pad = self.kernel_size - 1
-        x = F.pad(x, (pad, 0), mode='constant', value=0)
-        return self.pool(x)
 
 
 # ── conv stem blocks ──
@@ -469,7 +432,6 @@ class MCSTransQ2D2Config:
     # WavLM frontend adapter dims
     wavlm_in_dim: int = 512
     wavlm_rate: int = 50      # Hz (50=default, 200=L4 raw)
-    wavlm_down_type: str = "pool"  # "pool"|"replicate"|"conv"
 
 
 class MCSTransQ2D2(nn.Module):
@@ -561,7 +523,6 @@ class MCSTransQ2D2(nn.Module):
             self.wavlm_adapter: nn.Module | None = WavLMFrontendAdapter(
                 in_dim=config.wavlm_in_dim, out_dim=config.in_dim,
                 wavlm_rate=config.wavlm_rate,
-                down_type=config.wavlm_down_type,
                 dropout=config.dropout,
             )
         else:

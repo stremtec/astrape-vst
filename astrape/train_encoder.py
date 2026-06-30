@@ -310,9 +310,6 @@ def parse_args() -> argparse.Namespace:
                    help="Subdirectory for WavLM cache (default: wavlm_16k, use wavlm_L4 for L4)")
     p.add_argument("--wavlm-rate", type=int, default=50,
                    help="WavLM feature rate in Hz (50=default, 200=L4 raw)")
-    p.add_argument("--wavlm-down", default="pool",
-                   choices=["pool", "replicate", "conv"],
-                   help="Downsampler: pool (fixed avg), replicate (replicate-pad, α-decay), conv (learned)")
 
     return p.parse_args()
 
@@ -407,7 +404,6 @@ def main() -> None:
         stem_block_type=args.stem_block_type,
         use_wavlm_frontend=args.wavlm_frontend,
         wavlm_rate=args.wavlm_rate,
-        wavlm_down_type=args.wavlm_down,
         delta2_weight=args.delta2_weight,
         contrastive_weight=args.contrastive_weight,
         contrastive_tau=args.contrastive_tau,

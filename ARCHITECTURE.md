@@ -83,11 +83,10 @@ revisions):
 |-----------|-----------|---------------------|-------------|---------|
 | Resampler 44.1k→16k | 0 | ~2ms (anti-alias FIR) | — | ~0.1ms |
 | WavLM CNN L0-L4 (5 convs, frozen) | 0 | **~10ms** (160-sample RF) | — | 0.3ms |
-| StridingAdapter (200→50Hz) | 0 | 0 (replicate/pool/conv) | 3 frames | 0.05ms |
-|   ReplicatePool (α=0.8, fixed) | 0 | 0 (5ms boundary RF) | 3 frames | 0.05ms |
-|     α-decaying replicate-pad + avg_pool(k=4). | | | | |
-|     Merges avg_pool stability with causal 5ms delay. | | | | |
-|     pad = [α³x₀, α²x₀, α¹x₀] → Bayesian boundary prior. | | | | |
+| StridingAdapter (200→50Hz) | 0 | 0 | 3 frames | 0.05ms |
+|   CausalReplicatePool: α-decaying replicate-pad + avg_pool. | | | | |
+|   Merges avg_pool stability with causal 5ms delay, 0 params. | | | | |
+|   pad = [α³x₀, α²x₀, α¹x₀] → Bayesian boundary prior. | | | | |
 | Stem + Downsample | 0 | 0 | ~212 frames | 0.3ms |
 | Transformer 8L (causal window) | 0 | 0 | window=256 | 0.6ms |
 | Q2D2 | 0 | 0 | — | 0.01ms |
