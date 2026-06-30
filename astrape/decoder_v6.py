@@ -165,19 +165,20 @@ class ProsodyLSTM(nn.Module):
 # ═══════════════════════════════════════════════════════════════════
 
 class CausalConvNeXtBlock(nn.Module):
-    """ConvNeXt-v2: depthwise CausalConv → LN → PW expand → GELU → GRN → PW contract → +res."""
+    """ConvNeXt: depthwise CausalConv → LN → PW expand → GELU → LN → PW contract → +res.
+    LayerNorm per-position instead of CausalGRN — position-independent, stable."""
     def __init__(self, dim: int, kernel: int = 7, expand: int = 4):
         super().__init__()
         self.dw = CausalConv1d(dim, dim, kernel, groups=dim)
-        self.norm = _ChannelLN(dim)
+        self.norm1 = _ChannelLN(dim)
         self.pw1 = nn.Conv1d(dim, expand * dim, 1)
-        self.grn = CausalGRN(expand * dim)
+        self.norm2 = _ChannelLN(expand * dim)
         self.pw2 = nn.Conv1d(expand * dim, dim, 1)
         self.scale = nn.Parameter(1e-6 * torch.ones(1, dim, 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.dw(x); h = self.norm(h)
-        h = F.gelu(self.pw1(h)); h = self.grn(h); h = self.pw2(h)
+        h = self.dw(x); h = self.norm1(h)
+        h = F.gelu(self.pw1(h)); h = self.norm2(h); h = self.pw2(h)
         return x + self.scale * h
 
 
@@ -258,13 +259,14 @@ class CausalDecoderV6Config:
     speaker_dilations: tuple[int, ...] = (1, 2, 4, 8, 12, 16, 24, 32)
     speaker_kernel: int = 5
 
-    # ⑤ AA Upsampler 50→450Hz  (×3 then ×3)
-    upsampler_factors: tuple[int, ...] = (3, 3)
+    # ⑤ Upsampler 50Hz → STFT rate (fractional nearest-repeat + causal conv)
+    upsampler_factors: tuple[int, ...] = (3, 3)  # unused with n_fft=1512
 
     # ⑥ ISTFT Head
     istft_bridge_dim: int = 512
-    n_fft: int = 392
-    hop_length: int = 98          # 44100/98 = 450Hz = 18×25
+    istft_bridge_blocks: int = 2   # CausalResNet refinement before mag/phase projection
+    n_fft: int = 1512              # 757 freq bins @ 44.1kHz → 29Hz resolution
+    hop_length: int = 252          # 44100/252 = 175Hz, latency (1512-252)/2/44.1k = 14.3ms
     istft_padding: str = "same"
 
 
@@ -327,28 +329,19 @@ class CausalDecoderV6(nn.Module):
         ])
         self.fusion_norm = nn.LayerNorm(W)
 
-        #    Path B: Dilated speaker TCN (fine-grained local interaction)
-        #    This is the high-resolution speaker pathway — dilations up to 32
-        #    give ~640ms backward RF at 50Hz, plenty for formant texture.
-        self.speaker_blocks = nn.ModuleList([
-            DilatedSpeakerBlock(W, c.speaker_dim, c.speaker_kernel, d)
-            for d in c.speaker_dilations
-        ])
-
-        #    Merge: gate-weighted sum of both pathways
-        #    gate = sigmoid(learned) so init ≈ 0.5 each path
-        self.fusion_gate = nn.Parameter(torch.zeros(1, W, 1))
-
-        # ⑤ Post-fusion refinement + AA upsampler 50→450Hz
+        # ⑤ Post-fusion refinement + fractional upsample 50Hz → STFT rate
+        #    (near-repeat ×3.5, then causal conv to smooth)
         self.post_smooth = nn.ModuleList([
             CausalConvNeXtBlock(W, kernel=5) for _ in range(2)
         ])
-        self.upsampler = nn.ModuleList([
-            AAUpStage(W, W, factor=f, conv_k=7) for f in c.upsampler_factors
-        ])
 
-        # ⑥ Bridge + ISTFT head
-        self.istft_bridge = nn.Conv1d(W, c.istft_bridge_dim, kernel_size=1)
+        # ⑥ Bridge + ISTFT head — CausalResNet refinement before mag/phase projection
+        from .causal_wave_decoder import CausalResNetBlock
+        self.istft_bridge = nn.Sequential(
+            CausalResNetBlock(W, kernel_size=7),
+            CausalResNetBlock(W, kernel_size=7),
+            nn.Conv1d(W, c.istft_bridge_dim, kernel_size=1),
+        )
         from miocodec.module.istft_head import ISTFTHead
         self.istft_head = ISTFTHead(
             dim=c.istft_bridge_dim, n_fft=c.n_fft,
@@ -397,32 +390,24 @@ class CausalDecoderV6(nn.Module):
         T_50 = h.shape[-1]
         # Nearest-repeat is causal (each 50Hz frame copies its 25Hz parent)
         prosody_50 = prosody_cond.repeat_interleave(2, dim=1)[:, :T_50, :]  # (B, 2T, cond)
-        spk = speaker.unsqueeze(1)                       # (B, 1, 128)
 
         #    Path A: AdaLN transformer (global)
         h_a = h.transpose(1, 2)                          # (B, 2T, 512)
         for layer in self.fusion_layers:
             h_a = layer(h_a, prosody_50, self.fusion_rope, self.config.fusion_window)
-        h_a = self.fusion_norm(h_a).transpose(1, 2)     # (B, 512, 2T)
+        h = self.fusion_norm(h_a).transpose(1, 2)       # (B, 512, 2T)
 
-        #    Path B: Dilated speaker TCN (local)
-        h_b = h.clone()
-        for block in self.speaker_blocks:
-            h_b = block(h_b, spk)
-
-        #    Merge: gate-weighted sum
-        gate = torch.sigmoid(self.fusion_gate)           # ∈ (0, 1)
-        h = gate * h_a + (1 - gate) * h_b
-
-        # ⑤ Post-fusion refinement + AA upsampler 50→450Hz
+        # ⑤ Post-fusion refinement + fractional upsample 50Hz → STFT rate
         for block in self.post_smooth:
             h = block(h)
-        for block in self.upsampler:
-            h = block(h)                                 # (B, 512, 18T)
+        # Nearest-repeat ×3.5 (causal: each output copies its parent frame)
+        # 50Hz × 3.5 = 175Hz = STFT rate for n_fft=1512/hop=252
+        if stft_length != h.shape[-1]:
+            h = F.interpolate(h, size=stft_length, mode="nearest")
 
         # ⑥ Bridge + ISTFT
-        h = self.istft_bridge(h).transpose(1, 2)         # (B, 18T, bridge_dim)
-        xo = self.istft_head.out(h).transpose(1, 2)     # (B, n_fft+2, 18T)
+        h = self.istft_bridge(h).transpose(1, 2)         # (B, stft_len, bridge_dim)
+        xo = self.istft_head.out(h).transpose(1, 2)     # (B, n_fft+2, stft_len)
         mag_log, phase = xo.chunk(2, dim=1)
         mag = torch.exp(mag_log).clamp(max=1e2)
         wav = self.istft_head.istft(torch.complex(mag * torch.cos(phase), mag * torch.sin(phase)))
