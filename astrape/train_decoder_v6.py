@@ -27,6 +27,26 @@ from .decoder_v6 import CausalDecoderV6, CausalDecoderV6Config
 S = 44100
 
 
+@torch.no_grad()
+def evaluate_vs_teacher(dec, mio, loader, device, mel_fn, num_batches=20):
+    """Compute waveform and mel cosine similarity between student and teacher."""
+    wave_cos_all, mel_cos_all = [], []
+    for i, (content, audio, speaker, _) in enumerate(loader):
+        if i >= num_batches: break
+        content, audio, speaker = content.to(device), audio.to(device), speaker.to(device)
+        tch_len = mio._calculate_target_stft_length(audio.shape[1])
+        teacher = mio.forward_wave(content, speaker, stft_length=tch_len)
+        pred = dec(content, speaker)
+        tl = min(pred.shape[1], teacher.shape[1])
+        p, t = pred[0, :tl].float(), teacher[0, :tl].float()
+        wave_cos_all.append(F.cosine_similarity(p, t, dim=0).item())
+        # Mel cosine
+        pm = mel_fn(p.unsqueeze(0)).squeeze(0).flatten()
+        tm = mel_fn(t.unsqueeze(0)).squeeze(0).flatten()
+        mel_cos_all.append(F.cosine_similarity(pm, tm, dim=0).item())
+    return float(np.mean(wave_cos_all)), float(np.mean(mel_cos_all))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="mps")
@@ -148,6 +168,14 @@ def main():
             {"epoch": ep, "skipped": skipped,
              **{k: v.item() / max(steps - skipped, 1) for k, v in acc.items()}}, indent=2) + "\n")
         print(f"E{ep:02d} done", flush=True)
+        # ── eval: waveform cosine vs teacher ──
+        if ep % 5 == 0 or ep == args.epochs - 1:
+            dec.eval()
+            wave_cos, mel_cos = evaluate_vs_teacher(dec, mio, loader, device,
+                                                     mel_fn, num_batches=20)
+            print(f"  eval: wave_cos={wave_cos:.4f}  mel_cos={mel_cos:.4f}", flush=True)
+            (args.out_dir / "eval.json").write_text(json.dumps(
+                {"epoch": ep, "wave_cos": wave_cos, "mel_cos": mel_cos}, indent=2) + "\n")
     print(f"Done. {time.time()-t0:.0f}s", flush=True)
 
 
