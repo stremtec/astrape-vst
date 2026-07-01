@@ -294,8 +294,8 @@ class CausalDecoderV6Config:
     # ⑥ ISTFT Head
     istft_bridge_dim: int = 512
     istft_bridge_blocks: int = 2   # CausalResNet refinement before mag/phase projection
-    n_fft: int = 1512              # 757 freq bins @ 44.1kHz → 29Hz resolution
-    hop_length: int = 252          # 44100/252 = 175Hz, latency (1512-252)/2/44.1k = 14.3ms
+    n_fft: int = 392               # 197 freq bins — fewer bins = easier phase prediction
+    hop_length: int = 98            # 44100/98 = 450Hz, latency (392-98)/2/44.1k = 3.3ms
     istft_padding: str = "same"
 
 
@@ -421,12 +421,14 @@ class CausalDecoderV6(nn.Module):
         ])
         self.fusion_norm = nn.LayerNorm(W)
 
-        # ⑤ Post-fusion refinement + fractional upsample 50Hz → STFT rate
-        #    (near-repeat ×3.5, then causal conv to smooth)
+        # ⑤ Post-fusion refinement + upsample 50Hz → 450Hz (×9 = 3×3)
         self.post_smooth = nn.ModuleList([
             CausalConvNeXtBlock(W, kernel=5) for _ in range(2)
         ])
-        self.frac_up = AAFracUpsample(W, factor=3.5)
+        self.up_9x = nn.ModuleList([
+            AAUpStage(W, W, factor=3, conv_k=7),
+            AAUpStage(W, W, factor=3, conv_k=7),
+        ])
 
         # ⑥ Bridge + ISTFT head — frequency-aware mag/phase prediction
         #    The bridge outputs 512d time-domain features, then a 2D head
@@ -498,12 +500,11 @@ class CausalDecoderV6(nn.Module):
             h_a = layer(h_a, prosody_50, self.fusion_rope, self.config.fusion_window)
         h = self.fusion_norm(h_a).transpose(1, 2)       # (B, 512, 2T)
 
-        # ⑤ Post-fusion refinement + AA fractional upsample 50Hz → STFT rate
+        # ⑤ Post-fusion refinement + AA upsample 50Hz → 450Hz
         for block in self.post_smooth:
             h = block(h)
-        # AA-fractional: ×7 → low-pass → stride-2 = ×3.5 (175Hz)
-        # No stair-step, no phase jumps — anti-aliased throughout
-        h = self.frac_up(h)  # (B, W, stft_length)
+        for block in self.up_9x:
+            h = block(h)                                 # (B, 512, 18T)
 
         # ⑥ Bridge + ISTFT — two-branch: mag(log)+phase from shared Conv2d backbone
         h = self.istft_bridge(h).transpose(1, 2)         # (B, stft_len, bridge_dim)
